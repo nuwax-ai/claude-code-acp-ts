@@ -1,5 +1,5 @@
 {
-  "name": "@zed-industries/claude-code-acp",
+  "name": "claude-code-acp-ts",
   "publishConfig": {
     "access": "public"
   },
