@@ -846,42 +846,45 @@ export class ClaudeAcpAgent implements Agent {
 
     // 使用超时保护包装命令获取
     let availableCommands: AvailableCommand[] = [];
-    try {
-      availableCommands = await withTimeout(
-        getAvailableSlashCommands(q, this.logger),
-        COMMAND_FETCH_TIMEOUT_MS,
-        "getAvailableSlashCommands",
-        this.logger,
-      );
-    } catch (error) {
-      if (USE_DEFAULTS_ON_TIMEOUT) {
-        this.logger.log(`⚠️ [ACP] 获取命令失败，使用空列表: ${error}`);
-        availableCommands = [];
-      } else {
-        throw error;
-      }
-    }
+    // try {
+    //   availableCommands = await withTimeout(
+    //     getAvailableSlashCommands(q, this.logger),
+    //     COMMAND_FETCH_TIMEOUT_MS,
+    //     "getAvailableSlashCommands",
+    //     this.logger,
+    //   );
+    // } catch (error) {
+    //   if (USE_DEFAULTS_ON_TIMEOUT) {
+    //     this.logger.log(`⚠️ [ACP] 获取命令失败，使用空列表: ${error}`);
+    //     availableCommands = [];
+    //   } else {
+    //     throw error;
+    //   }
+    // }
 
     // 使用超时保护包装模型获取
-    let models: SessionModelState;
-    try {
-      models = await withTimeout(
-        getAvailableModels(q, this.logger),
-        MODEL_FETCH_TIMEOUT_MS,
-        "getAvailableModels",
-        this.logger,
-      );
-    } catch (error) {
-      if (USE_DEFAULTS_ON_TIMEOUT) {
-        this.logger.log(`⚠️ [ACP] 获取模型失败，使用默认值: ${error}`);
-        models = {
-          availableModels: [],
-          currentModelId: "",
-        };
-      } else {
-        throw error;
-      }
-    }
+    let models: SessionModelState = {
+      availableModels: [],
+      currentModelId: "",
+    };
+    // try {
+    //   models = await withTimeout(
+    //     getAvailableModels(q, this.logger),
+    //     MODEL_FETCH_TIMEOUT_MS,
+    //     "getAvailableModels",
+    //     this.logger,
+    //   );
+    // } catch (error) {
+    //   if (USE_DEFAULTS_ON_TIMEOUT) {
+    //     this.logger.log(`⚠️ [ACP] 获取模型失败，使用默认值: ${error}`);
+    //     models = {
+    //       availableModels: [],
+    //       currentModelId: "",
+    //     };
+    //   } else {
+    //     throw error;
+    //   }
+    // }
 
     const sessionCreateElapsed = Date.now() - sessionCreateStartTime;
     this.logger.log(`✅ [ACP] 会话创建完成, 总耗时: ${sessionCreateElapsed}ms`);
