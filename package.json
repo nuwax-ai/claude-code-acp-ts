@@ -7,7 +7,7 @@
   "description": "An ACP-compatible coding agent powered by the Claude Code SDK (TypeScript)",
   "main": "dist/lib.js",
   "bin": {
-    "claude-code-acp": "./dist/index.js"
+    "claude-code-acp-ts": "./dist/index.js"
   },
   "type": "module",
   "files": [
