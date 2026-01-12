@@ -63,6 +63,56 @@ import { randomUUID } from "node:crypto";
 
 export const CLAUDE_CONFIG_DIR = process.env.CLAUDE ?? path.join(os.homedir(), ".claude");
 
+// ==================== 超时配置 ====================
+// 可通过环境变量覆盖默认值
+
+/** 获取模型列表超时时间（毫秒），默认 30 秒 */
+const MODEL_FETCH_TIMEOUT_MS = parseInt(process.env.ACP_MODEL_FETCH_TIMEOUT_MS || "30000", 10);
+
+/** 获取命令列表超时时间（毫秒），默认 30 秒 */
+const COMMAND_FETCH_TIMEOUT_MS = parseInt(process.env.ACP_COMMAND_FETCH_TIMEOUT_MS || "30000", 10);
+
+/** 超时后是否使用默认值继续（而不是抛出错误），默认 true */
+const USE_DEFAULTS_ON_TIMEOUT = process.env.ACP_USE_DEFAULTS_ON_TIMEOUT !== "false";
+
+/**
+ * 为 Promise 添加超时保护
+ * @param promise 要执行的 Promise
+ * @param timeoutMs 超时时间（毫秒）
+ * @param operationName 操作名称（用于日志）
+ * @param logger 日志记录器
+ * @returns Promise 执行结果
+ */
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  operationName: string,
+  logger: Logger = console,
+): Promise<T> {
+  const start = Date.now();
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      const elapsed = Date.now() - start;
+      logger.error(`⏰ [ACP] ${operationName} 超时 (${timeoutMs}ms), 实际耗时: ${elapsed}ms`);
+      reject(new Error(`${operationName} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    const result = await Promise.race([promise, timeoutPromise]);
+    const elapsed = Date.now() - start;
+    if (elapsed > 5000) {
+      logger.log(`⚠️ [ACP] ${operationName} 耗时较长: ${elapsed}ms`);
+    } else {
+      logger.log(`✓ [ACP] ${operationName} 完成, 耗时: ${elapsed}ms`);
+    }
+    return result;
+  } catch (error) {
+    throw error;
+  }
+}
+
 /**
  * Logger interface for customizing logging output
  */
@@ -81,14 +131,14 @@ type Session = {
 
 type BackgroundTerminal =
   | {
-      handle: TerminalHandle;
-      status: "started";
-      lastOutput: TerminalOutputResponse | null;
-    }
+    handle: TerminalHandle;
+    status: "started";
+    lastOutput: TerminalOutputResponse | null;
+  }
   | {
-      status: "aborted" | "exited" | "killed" | "timedOut";
-      pendingOutput: TerminalOutputResponse;
-    };
+    status: "aborted" | "exited" | "killed" | "timedOut";
+    pendingOutput: TerminalOutputResponse;
+  };
 
 /**
  * Extra metadata that can be given to Claude Code when creating a new session.
@@ -382,7 +432,7 @@ export class ClaudeAcpAgent implements Agent {
           const content =
             message.type === "assistant"
               ? // Handled by stream events above
-                message.message.content.filter((item) => !["text", "thinking"].includes(item.type))
+              message.message.content.filter((item) => !["text", "thinking"].includes(item.type))
               : message.message.content;
 
           for (const notification of toAcpNotifications(
@@ -769,6 +819,16 @@ export class ClaudeAcpAgent implements Agent {
       throw new Error("Cancelled");
     }
 
+    // ==================== 会话创建开始 ====================
+    const sessionCreateStartTime = Date.now();
+    this.logger.log(`🔵 [ACP] 开始创建会话`);
+    this.logger.log(`   ├─ sessionId: ${sessionId}`);
+    this.logger.log(`   ├─ cwd: ${params.cwd}`);
+    this.logger.log(`   └─ MCP 服务器数量: ${Object.keys(mcpServers).length}`);
+    if (Object.keys(mcpServers).length > 0) {
+      this.logger.log(`   └─ MCP 服务器列表: ${Object.keys(mcpServers).join(", ")}`);
+    }
+
     const q = query({
       prompt: input,
       options,
@@ -782,8 +842,49 @@ export class ClaudeAcpAgent implements Agent {
       settingsManager,
     };
 
-    const availableCommands = await getAvailableSlashCommands(q);
-    const models = await getAvailableModels(q);
+    this.logger.log(`📋 [ACP] 开始获取可用命令和模型...`);
+
+    // 使用超时保护包装命令获取
+    let availableCommands: AvailableCommand[] = [];
+    try {
+      availableCommands = await withTimeout(
+        getAvailableSlashCommands(q, this.logger),
+        COMMAND_FETCH_TIMEOUT_MS,
+        "getAvailableSlashCommands",
+        this.logger,
+      );
+    } catch (error) {
+      if (USE_DEFAULTS_ON_TIMEOUT) {
+        this.logger.log(`⚠️ [ACP] 获取命令失败，使用空列表: ${error}`);
+        availableCommands = [];
+      } else {
+        throw error;
+      }
+    }
+
+    // 使用超时保护包装模型获取
+    let models: SessionModelState;
+    try {
+      models = await withTimeout(
+        getAvailableModels(q, this.logger),
+        MODEL_FETCH_TIMEOUT_MS,
+        "getAvailableModels",
+        this.logger,
+      );
+    } catch (error) {
+      if (USE_DEFAULTS_ON_TIMEOUT) {
+        this.logger.log(`⚠️ [ACP] 获取模型失败，使用默认值: ${error}`);
+        models = {
+          availableModels: [],
+          currentModelId: "",
+        };
+      } else {
+        throw error;
+      }
+    }
+
+    const sessionCreateElapsed = Date.now() - sessionCreateStartTime;
+    this.logger.log(`✅ [ACP] 会话创建完成, 总耗时: ${sessionCreateElapsed}ms`);
 
     // Needs to happen after we return the session
     setTimeout(() => {
@@ -838,10 +939,19 @@ export class ClaudeAcpAgent implements Agent {
   }
 }
 
-async function getAvailableModels(query: Query): Promise<SessionModelState> {
+async function getAvailableModels(query: Query, logger: Logger = console): Promise<SessionModelState> {
+  const startTime = Date.now();
+  logger.log(`   📋 [ACP] 开始获取可用模型列表...`);
+
   const models = await query.supportedModels();
+  logger.log(`   📋 [ACP] 获取到 ${models.length} 个模型, 耗时: ${Date.now() - startTime}ms`);
 
   // Query doesn't give us access to the currently selected model, so we just choose the first model in the list.
+  if (models.length === 0) {
+    logger.log(`   ⚠️ [ACP] 没有可用模型`);
+    return { availableModels: [], currentModelId: "" };
+  }
+
   const currentModel = models[0];
   await query.setModel(currentModel.value);
 
@@ -857,7 +967,10 @@ async function getAvailableModels(query: Query): Promise<SessionModelState> {
   };
 }
 
-async function getAvailableSlashCommands(query: Query): Promise<AvailableCommand[]> {
+async function getAvailableSlashCommands(query: Query, logger: Logger = console): Promise<AvailableCommand[]> {
+  const startTime = Date.now();
+  logger.log(`   📋 [ACP] 开始获取可用斜杠命令...`);
+
   const UNSUPPORTED_COMMANDS = [
     "context",
     "cost",
@@ -868,6 +981,7 @@ async function getAvailableSlashCommands(query: Query): Promise<AvailableCommand
     "todos",
   ];
   const commands = await query.supportedCommands();
+  logger.log(`   📋 [ACP] 获取到 ${commands.length} 个斜杠命令, 耗时: ${Date.now() - startTime}ms`);
 
   return commands
     .map((command) => {
