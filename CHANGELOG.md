@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.10
+
+- Rename package to `claude-code-acp-ts` to avoid npm naming conflict
+- Rename bin command to `claude-code-acp-ts`
+- Commit built assets for easier GitHub installation
+- Fix: Disable model and slash commands query to improve startup performance
+- Update repository URLs to new location (dongdada29/claude-code-acp-ts)
+
 ## 0.12.6
 
 - Fix model selection
