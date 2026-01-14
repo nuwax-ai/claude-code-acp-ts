@@ -1,6 +1,8 @@
-# ACP adapter for Claude Code
+# ACP adapter for Claude Code (TypeScript)
 
-[![npm](https://img.shields.io/npm/v/%40zed-industries%2Fclaude-code-acp)](https://www.npmjs.com/package/@zed-industries/claude-code-acp)
+[![npm](https://img.shields.io/npm/v/claude-code-acp-ts)](https://www.npmjs.com/package/claude-code-acp-ts)
+
+> **Note**: This is a fork of [@zed-industries/claude-code-acp](https://github.com/zed-industries/claude-code-acp), maintained by [nuwax-ai](https://github.com/nuwax-ai).
 
 Use [Claude Code](https://www.anthropic.com/claude-code) from [ACP-compatible](https://agentclientprotocol.com) clients such as [Zed](https://zed.dev)!
 
@@ -39,13 +41,13 @@ Or try it with any of the other [ACP compatible clients](https://agentclientprot
 Install the adapter from `npm`:
 
 ```bash
-npm install -g @zed-industries/claude-code-acp
+npm install -g claude-code-acp-ts
 ```
 
-You can then use `claude-code-acp` as a regular ACP agent:
+You can then use `claude-code-acp-ts` as a regular ACP agent:
 
-```
-ANTHROPIC_API_KEY=sk-... claude-code-acp
+```bash
+ANTHROPIC_API_KEY=sk-... claude-code-acp-ts
 ```
 
 ## License
