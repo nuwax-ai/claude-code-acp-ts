@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.12.9",
+  "version": "0.12.10",
   "description": "An ACP-compatible coding agent powered by the Claude Code SDK (TypeScript)",
   "main": "dist/lib.js",
   "bin": {
@@ -40,13 +40,13 @@
     "sdk",
     "code"
   ],
-  "homepage": "https://github.com/zed-industries/claude-code-acp#readme",
+  "homepage": "https://github.com/dongdada29/claude-code-acp-ts#readme",
   "bugs": {
-    "url": "https://github.com/zed-industries/claude-code-acp/issues"
+    "url": "https://github.com/dongdada29/claude-code-acp-ts/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zed-industries/claude-code-acp.git"
+    "url": "git+https://github.com/dongdada29/claude-code-acp-ts.git"
   },
   "author": "Zed Industries",
   "license": "Apache-2.0",
