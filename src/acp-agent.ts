@@ -720,10 +720,16 @@ export class ClaudeAcpAgent implements Agent {
       extraArgs["session-id"] = sessionId;
     }
 
+    // Configure thinking tokens from environment variable
+    const maxThinkingTokens = process.env.MAX_THINKING_TOKENS
+      ? parseInt(process.env.MAX_THINKING_TOKENS, 10)
+      : undefined;
+
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
       stderr: (err) => this.logger.error(err),
+      ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
       // Override certain fields that must be controlled by ACP
       cwd: params.cwd,
@@ -741,6 +747,7 @@ export class ClaudeAcpAgent implements Agent {
       ...(process.env.CLAUDE_CODE_EXECUTABLE && {
         pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE,
       }),
+      tools: { type: "preset", preset: "claude_code" },
       hooks: {
         ...userProvidedOptions?.hooks,
         PreToolUse: [
@@ -760,7 +767,8 @@ export class ClaudeAcpAgent implements Agent {
     };
 
     const allowedTools = [];
-    const disallowedTools = [];
+    // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
+    const disallowedTools = ["AskUserQuestion"];
 
     // Check if built-in tools should be disabled
     const disableBuiltInTools = params._meta?.disableBuiltInTools === true;
@@ -988,7 +996,13 @@ async function getAvailableSlashCommands(query: Query, logger: Logger = console)
 
   return commands
     .map((command) => {
-      const input = command.argumentHint ? { hint: command.argumentHint } : null;
+      const input = command.argumentHint
+        ? {
+            hint: Array.isArray(command.argumentHint)
+              ? command.argumentHint.join(" ")
+              : command.argumentHint,
+          }
+        : null;
       let name = command.name;
       if (command.name.endsWith(" (MCP)")) {
         name = `mcp:${name.replace(" (MCP)", "")}`;

@@ -1,12 +1,15 @@
 # Changelog
 
-## 0.12.10
+## 0.13.1
 
-- Rename package to `claude-code-acp-ts` to avoid npm naming conflict
-- Rename bin command to `claude-code-acp-ts`
-- Commit built assets for easier GitHub installation
-- Fix: Disable model and slash commands query to improve startup performance
-- Update repository URLs to new location (dongdada29/claude-code-acp-ts)
+- Update to @anthropic-ai/claude-agent-sdk@0.2.7
+- Add TypeScript declaration files for library users
+- Fixed error handling in custom ACP focused MCP tools
+
+## 0.13.0
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.6
+- Update to @agentclientprotocol/sdk@0.13.0
 
 ## 0.12.6
 
