@@ -81,7 +81,8 @@ function normalizePath(filePath, cwd) {
     else if (!path.isAbsolute(filePath)) {
         filePath = path.join(cwd, filePath);
     }
-    return path.normalize(filePath);
+    // Convert backslashes to forward slashes for minimatch compatibility on Windows
+    return path.normalize(filePath).replace(/\\/g, "/");
 }
 /**
  * Checks if a file path matches a glob pattern
@@ -103,7 +104,7 @@ function matchesRule(rule, toolName, toolInput, cwd) {
     // - "Edit rules apply to all built-in tools that edit files."
     // - "Claude will make a best-effort attempt to apply Read rules to all built-in tools
     //    that read files like Grep, Glob, and LS."
-    const ruleAppliesToTool = rule.toolName === "Bash" ||
+    const ruleAppliesToTool = (rule.toolName === "Bash" && toolName === acpToolNames.bash) ||
         (rule.toolName === "Edit" && FILE_EDITING_TOOLS.includes(toolName)) ||
         (rule.toolName === "Read" && FILE_READING_TOOLS.includes(toolName));
     if (!ruleAppliesToTool) {
@@ -287,6 +288,9 @@ export class SettingsManager {
             }
             if (settings.env) {
                 merged.env = { ...merged.env, ...settings.env };
+            }
+            if (settings.model) {
+                merged.model = settings.model;
             }
         }
         this.mergedSettings = merged;

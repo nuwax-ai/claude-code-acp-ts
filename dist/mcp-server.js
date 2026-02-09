@@ -535,15 +535,54 @@ Output: Create directory 'foo'`),
 
 In sessions with ${acpToolNames.bashOutput} always use it for output from Bash commands instead of TaskOutput.`,
             inputSchema: {
-                bash_id: z
+                task_id: z
                     .string()
                     .describe(`The id of the background bash command as returned by \`${acpToolNames.bash}\``),
+                block: z.boolean().describe("Whether to wait for completion"),
+                timeout: z.number().describe("Max wait time in ms"),
             },
         }, async (input) => {
             try {
-                const bgTerm = agent.backgroundTerminals[input.bash_id];
+                const bgTerm = agent.backgroundTerminals[input.task_id];
                 if (!bgTerm) {
-                    throw new Error(`Unknown shell ${input.bash_id}`);
+                    throw new Error(`Unknown shell ${input.task_id}`);
+                }
+                if (input.block && bgTerm.status === "started") {
+                    const statusPromise = Promise.race([
+                        bgTerm.handle
+                            .waitForExit()
+                            .then((exitStatus) => ({ status: "exited", exitStatus })),
+                        sleep(input.timeout ?? 2 * 60 * 1000).then(async () => {
+                            if (bgTerm.status === "started") {
+                                await bgTerm.handle.kill();
+                            }
+                            return { status: "timedOut", exitStatus: null };
+                        }),
+                    ]);
+                    const { status, exitStatus } = await statusPromise;
+                    const currentOutput = await bgTerm.handle.currentOutput();
+                    const strippedOutput = stripCommonPrefix(bgTerm.lastOutput?.output ?? "", currentOutput.output);
+                    agent.backgroundTerminals[input.task_id] = {
+                        status,
+                        pendingOutput: {
+                            ...currentOutput,
+                            output: strippedOutput,
+                            exitStatus: exitStatus ?? currentOutput.exitStatus,
+                        },
+                    };
+                    await bgTerm.handle.release();
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: toolCommandOutput(status, {
+                                    ...currentOutput,
+                                    output: strippedOutput,
+                                    exitStatus: exitStatus ?? currentOutput.exitStatus,
+                                }),
+                            },
+                        ],
+                    };
                 }
                 if (bgTerm.status === "started") {
                     const newOutput = await bgTerm.handle.currentOutput();

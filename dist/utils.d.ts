@@ -29,4 +29,5 @@ export interface ExtractLinesResult {
  * @returns Object containing extracted content and metadata
  */
 export declare function extractLinesWithByteLimit(fullContent: string, maxContentLength: number): ExtractLinesResult;
+export declare function encodeProjectPath(cwd: string): string;
 //# sourceMappingURL=utils.d.ts.map

@@ -28,6 +28,7 @@ export interface PermissionSettings {
 export interface ClaudeCodeSettings {
   permissions?: PermissionSettings;
   env?: Record<string, string>;
+  model?: string;
 }
 
 export type PermissionDecision = "allow" | "deny" | "ask";
@@ -128,7 +129,8 @@ function normalizePath(filePath: string, cwd: string): string {
   } else if (!path.isAbsolute(filePath)) {
     filePath = path.join(cwd, filePath);
   }
-  return path.normalize(filePath);
+  // Convert backslashes to forward slashes for minimatch compatibility on Windows
+  return path.normalize(filePath).replace(/\\/g, "/");
 }
 
 /**
@@ -154,7 +156,7 @@ function matchesRule(rule: ParsedRule, toolName: string, toolInput: unknown, cwd
   // - "Claude will make a best-effort attempt to apply Read rules to all built-in tools
   //    that read files like Grep, Glob, and LS."
   const ruleAppliesToTool =
-    rule.toolName === "Bash" ||
+    (rule.toolName === "Bash" && toolName === acpToolNames.bash) ||
     (rule.toolName === "Edit" && FILE_EDITING_TOOLS.includes(toolName)) ||
     (rule.toolName === "Read" && FILE_READING_TOOLS.includes(toolName));
 
@@ -368,6 +370,10 @@ export class SettingsManager {
 
       if (settings.env) {
         merged.env = { ...merged.env, ...settings.env };
+      }
+
+      if (settings.model) {
+        merged.model = settings.model;
       }
     }
 

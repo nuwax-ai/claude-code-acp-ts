@@ -448,15 +448,20 @@ export function toolUpdateFromToolResult(toolResult, toolUse) {
 function toAcpContentUpdate(content, isError = false) {
     if (Array.isArray(content) && content.length > 0) {
         return {
-            content: content.map((content) => ({
+            content: content.map((c) => ({
                 type: "content",
-                content: isError && content.type === "text"
-                    ? {
-                        ...content,
-                        text: `\`\`\`\n${content.text}\n\`\`\``,
-                    }
-                    : content,
+                content: toAcpContentBlock(c, isError),
             })),
+        };
+    }
+    else if (typeof content === "object" && content !== null && "type" in content) {
+        return {
+            content: [
+                {
+                    type: "content",
+                    content: toAcpContentBlock(content, isError),
+                },
+            ],
         };
     }
     else if (typeof content === "string" && content.length > 0) {
@@ -473,6 +478,62 @@ function toAcpContentUpdate(content, isError = false) {
         };
     }
     return {};
+}
+function toAcpContentBlock(content, isError) {
+    const wrapText = (text) => ({
+        type: "text",
+        text: isError ? `\`\`\`\n${text}\n\`\`\`` : text,
+    });
+    switch (content.type) {
+        case "text":
+            return {
+                type: "text",
+                text: isError ? `\`\`\`\n${content.text}\n\`\`\`` : content.text,
+            };
+        case "image":
+            if (content.source.type === "base64") {
+                return {
+                    type: "image",
+                    data: content.source.data,
+                    mimeType: content.source.media_type,
+                };
+            }
+            // URL and file-based images can't be converted to ACP format (requires data)
+            return wrapText(content.source.type === "url"
+                ? `[image: ${content.source.url}]`
+                : "[image: file reference]");
+        case "tool_reference":
+            return wrapText(`Tool: ${content.tool_name}`);
+        case "tool_search_tool_search_result":
+            return wrapText(`Tools found: ${content.tool_references.map((r) => r.tool_name).join(", ") || "none"}`);
+        case "tool_search_tool_result_error":
+            return wrapText(`Error: ${content.error_code}${content.error_message ? ` - ${content.error_message}` : ""}`);
+        case "web_search_result":
+            return wrapText(`${content.title} (${content.url})`);
+        case "web_search_tool_result_error":
+            return wrapText(`Error: ${content.error_code}`);
+        case "web_fetch_result":
+            return wrapText(`Fetched: ${content.url}`);
+        case "web_fetch_tool_result_error":
+            return wrapText(`Error: ${content.error_code}`);
+        case "code_execution_result":
+            return wrapText(`Output: ${content.stdout || content.stderr || ""}`);
+        case "bash_code_execution_result":
+            return wrapText(`Output: ${content.stdout || content.stderr || ""}`);
+        case "code_execution_tool_result_error":
+        case "bash_code_execution_tool_result_error":
+            return wrapText(`Error: ${content.error_code}`);
+        case "text_editor_code_execution_view_result":
+            return wrapText(content.content);
+        case "text_editor_code_execution_create_result":
+            return wrapText(content.is_file_update ? "File updated" : "File created");
+        case "text_editor_code_execution_str_replace_result":
+            return wrapText(content.lines?.join("\n") || "");
+        case "text_editor_code_execution_tool_result_error":
+            return wrapText(`Error: ${content.error_code}${content.error_message ? ` - ${content.error_message}` : ""}`);
+        default:
+            return wrapText(JSON.stringify(content));
+    }
 }
 export function planEntries(input) {
     return input.todos.map((input) => ({
@@ -499,16 +560,22 @@ export const registerHookCallback = (toolUseID, { onPostToolUseHook, }) => {
     };
 };
 /* A callback for Claude Code that is called when receiving a PostToolUse hook */
-export const createPostToolUseHook = (logger = console) => async (input, toolUseID) => {
-    if (input.hook_event_name === "PostToolUse" && toolUseID) {
-        const onPostToolUseHook = toolUseCallbacks[toolUseID]?.onPostToolUseHook;
-        if (onPostToolUseHook) {
-            await onPostToolUseHook(toolUseID, input.tool_input, input.tool_response);
-            delete toolUseCallbacks[toolUseID]; // Cleanup after execution
+export const createPostToolUseHook = (logger = console, options) => async (input, toolUseID) => {
+    if (input.hook_event_name === "PostToolUse") {
+        // Handle EnterPlanMode tool - notify client of mode change after successful execution
+        if (input.tool_name === "EnterPlanMode" && options?.onEnterPlanMode) {
+            await options.onEnterPlanMode();
         }
-        else {
-            logger.error(`No onPostToolUseHook found for tool use ID: ${toolUseID}`);
-            delete toolUseCallbacks[toolUseID];
+        if (toolUseID) {
+            const onPostToolUseHook = toolUseCallbacks[toolUseID]?.onPostToolUseHook;
+            if (onPostToolUseHook) {
+                await onPostToolUseHook(toolUseID, input.tool_input, input.tool_response);
+                delete toolUseCallbacks[toolUseID]; // Cleanup after execution
+            }
+            else {
+                logger.error(`No onPostToolUseHook found for tool use ID: ${toolUseID}`);
+                delete toolUseCallbacks[toolUseID];
+            }
         }
     }
     return { continue: true };

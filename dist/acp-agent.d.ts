@@ -1,4 +1,4 @@
-import { Agent, AgentSideConnection, AuthenticateRequest, CancelNotification, ClientCapabilities, ForkSessionRequest, ForkSessionResponse, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse, ResumeSessionRequest, ResumeSessionResponse, SessionNotification, SetSessionModelRequest, SetSessionModelResponse, SetSessionModeRequest, SetSessionModeResponse, TerminalHandle, TerminalOutputResponse, WriteTextFileRequest, WriteTextFileResponse } from "@agentclientprotocol/sdk";
+import { Agent, AgentSideConnection, AuthenticateRequest, CancelNotification, ClientCapabilities, ForkSessionRequest, ForkSessionResponse, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse, ListSessionsRequest, ListSessionsResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse, ResumeSessionRequest, ResumeSessionResponse, SessionNotification, SetSessionModelRequest, SetSessionModelResponse, SetSessionModeRequest, SetSessionModeResponse, TerminalHandle, TerminalOutputResponse, WriteTextFileRequest, WriteTextFileResponse } from "@agentclientprotocol/sdk";
 import { SettingsManager } from "./settings.js";
 import { CanUseTool, Options, PermissionMode, Query, SDKPartialAssistantMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { Pushable } from "./utils.js";
@@ -44,6 +44,7 @@ export type NewSessionMeta = {
          * Those parameters will be used and updated to work with ACP:
          *   - hooks (merged with ACP's hooks)
          *   - mcpServers (merged with ACP's mcpServers)
+         *   - disallowedTools (merged with ACP's disallowedTools)
          */
         options?: Options;
     };
@@ -57,12 +58,12 @@ export type ToolUpdateMeta = {
         toolResponse?: unknown;
     };
 };
-type ToolUseCache = {
+export type ToolUseCache = {
     [key: string]: {
         type: "tool_use" | "server_tool_use" | "mcp_tool_use";
         id: string;
         name: string;
-        input: any;
+        input: unknown;
     };
 };
 export declare class ClaudeAcpAgent implements Agent {
@@ -81,11 +82,19 @@ export declare class ClaudeAcpAgent implements Agent {
     newSession(params: NewSessionRequest): Promise<NewSessionResponse>;
     unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse>;
     unstable_resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse>;
+    loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse>;
+    /**
+     * List Claude Code sessions by parsing JSONL files
+     * Sessions are stored in ~/.claude/projects/<path-encoded>/
+     * Implements the draft session/list RFD spec
+     */
+    unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse>;
     authenticate(_params: AuthenticateRequest): Promise<void>;
     prompt(params: PromptRequest): Promise<PromptResponse>;
     cancel(params: CancelNotification): Promise<void>;
     unstable_setSessionModel(params: SetSessionModelRequest): Promise<SetSessionModelResponse | void>;
     setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse>;
+    private replaySessionHistory;
     readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse>;
     writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse>;
     canUseTool(sessionId: string): CanUseTool;
@@ -96,7 +105,9 @@ export declare function promptToClaude(prompt: PromptRequest): SDKUserMessage;
  * Convert an SDKAssistantMessage (Claude) to a SessionNotification (ACP).
  * Only handles text, image, and thinking chunks for now.
  */
-export declare function toAcpNotifications(content: string | ContentBlockParam[] | BetaContentBlock[] | BetaRawContentBlockDelta[], role: "assistant" | "user", sessionId: string, toolUseCache: ToolUseCache, client: AgentSideConnection, logger: Logger): SessionNotification[];
+export declare function toAcpNotifications(content: string | ContentBlockParam[] | BetaContentBlock[] | BetaRawContentBlockDelta[], role: "assistant" | "user", sessionId: string, toolUseCache: ToolUseCache, client: AgentSideConnection, logger: Logger, options?: {
+    registerHooks?: boolean;
+}): SessionNotification[];
 export declare function streamEventToAcpNotifications(message: SDKPartialAssistantMessage, sessionId: string, toolUseCache: ToolUseCache, client: AgentSideConnection, logger: Logger): SessionNotification[];
 export declare function runAcp(): void;
 export {};

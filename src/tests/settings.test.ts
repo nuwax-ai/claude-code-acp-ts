@@ -465,6 +465,41 @@ describe("SettingsManager", () => {
       });
       expect(envResult.decision).toBe("deny");
     });
+
+    it("should merge model setting with later sources taking precedence", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.promises.mkdir(claudeDir, { recursive: true });
+
+      // Project settings with one model
+      await fs.promises.writeFile(
+        path.join(claudeDir, "settings.json"),
+        JSON.stringify({
+          model: "claude-3-5-sonnet",
+        }),
+      );
+
+      settingsManager = new SettingsManager(tempDir);
+      await settingsManager.initialize();
+
+      let settings = settingsManager.getSettings();
+      expect(settings.model).toBe("claude-3-5-sonnet");
+
+      // Add local settings that override the model
+      await fs.promises.writeFile(
+        path.join(claudeDir, "settings.local.json"),
+        JSON.stringify({
+          model: "claude-3-5-haiku",
+        }),
+      );
+
+      // Re-initialize to pick up local settings
+      settingsManager.dispose();
+      settingsManager = new SettingsManager(tempDir);
+      await settingsManager.initialize();
+
+      settings = settingsManager.getSettings();
+      expect(settings.model).toBe("claude-3-5-haiku");
+    });
   });
 
   describe("ask rules", () => {
@@ -612,6 +647,121 @@ describe("SettingsManager", () => {
 
       // Cleanup second temp dir
       await fs.promises.rm(tempDir2, { recursive: true, force: true });
+    });
+  });
+
+  describe("cross-tool rule isolation", () => {
+    // These tests verify the fix in commit d471ccf:
+    // Permission rules should only match their intended tool type.
+    // A Bash rule should not match Edit/Write/Read operations, and vice versa.
+
+    it("should not apply Bash rules to Edit tool calls", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.promises.mkdir(claudeDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(claudeDir, "settings.json"),
+        JSON.stringify({
+          permissions: {
+            // This Bash rule has an argument that looks like a glob pattern.
+            // Before the fix, it would incorrectly match Edit operations
+            // because the argument would be interpreted as a file glob.
+            allow: ["Bash(./**:*)"],
+          },
+        }),
+      );
+
+      settingsManager = new SettingsManager(tempDir);
+      await settingsManager.initialize();
+
+      // Bash rule should NOT allow Edit operations
+      const result = settingsManager.checkPermission("mcp__acp__Edit", {
+        file_path: path.join(tempDir, "any-file.txt"),
+      });
+      expect(result.decision).toBe("ask");
+    });
+
+    it("should not apply Bash rules to Write tool calls", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.promises.mkdir(claudeDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(claudeDir, "settings.json"),
+        JSON.stringify({
+          permissions: {
+            allow: ["Bash(./**:*)"],
+          },
+        }),
+      );
+
+      settingsManager = new SettingsManager(tempDir);
+      await settingsManager.initialize();
+
+      const result = settingsManager.checkPermission("mcp__acp__Write", {
+        file_path: path.join(tempDir, "any-file.txt"),
+      });
+      expect(result.decision).toBe("ask");
+    });
+
+    it("should not apply Bash rules to Read tool calls", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.promises.mkdir(claudeDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(claudeDir, "settings.json"),
+        JSON.stringify({
+          permissions: {
+            allow: ["Bash(./**:*)"],
+          },
+        }),
+      );
+
+      settingsManager = new SettingsManager(tempDir);
+      await settingsManager.initialize();
+
+      const result = settingsManager.checkPermission("mcp__acp__Read", {
+        file_path: path.join(tempDir, "any-file.txt"),
+      });
+      expect(result.decision).toBe("ask");
+    });
+
+    it("should not apply Edit rules to Bash tool calls", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.promises.mkdir(claudeDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(claudeDir, "settings.json"),
+        JSON.stringify({
+          permissions: {
+            allow: ["Edit"],
+          },
+        }),
+      );
+
+      settingsManager = new SettingsManager(tempDir);
+      await settingsManager.initialize();
+
+      const result = settingsManager.checkPermission("mcp__acp__Bash", {
+        command: "echo hello",
+      });
+      expect(result.decision).toBe("ask");
+    });
+
+    it("should not apply Read rules to Bash tool calls", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.promises.mkdir(claudeDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(claudeDir, "settings.json"),
+        JSON.stringify({
+          permissions: {
+            allow: ["Read"],
+          },
+        }),
+      );
+
+      settingsManager = new SettingsManager(tempDir);
+      await settingsManager.initialize();
+
+      const result = settingsManager.checkPermission("mcp__acp__Bash", {
+        command: "ls -la",
+      });
+      expect(result.decision).toBe("ask");
     });
   });
 });

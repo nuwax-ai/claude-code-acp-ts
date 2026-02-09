@@ -19,6 +19,7 @@ export interface PermissionSettings {
 export interface ClaudeCodeSettings {
     permissions?: PermissionSettings;
     env?: Record<string, string>;
+    model?: string;
 }
 export type PermissionDecision = "allow" | "deny" | "ask";
 export interface PermissionCheckResult {

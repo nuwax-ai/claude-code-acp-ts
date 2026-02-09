@@ -2,13 +2,16 @@ import {
   Agent,
   AgentSideConnection,
   AuthenticateRequest,
-  AvailableCommand,
   CancelNotification,
   ClientCapabilities,
   ForkSessionRequest,
   ForkSessionResponse,
   InitializeRequest,
   InitializeResponse,
+  LoadSessionRequest,
+  LoadSessionResponse,
+  ListSessionsRequest,
+  ListSessionsResponse,
   ndJsonStream,
   NewSessionRequest,
   NewSessionResponse,
@@ -19,6 +22,7 @@ import {
   RequestError,
   ResumeSessionRequest,
   ResumeSessionResponse,
+  SessionInfo,
   SessionModelState,
   SessionNotification,
   SetSessionModelRequest,
@@ -43,8 +47,15 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as readline from "node:readline";
 import * as os from "node:os";
-import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
+import {
+  encodeProjectPath,
+  nodeToWebReadable,
+  nodeToWebWritable,
+  Pushable,
+  unreachable,
+} from "./utils.js";
 import { createMcpServer } from "./mcp-server.js";
 import { EDIT_TOOL_NAMES, acpToolNames } from "./tools.js";
 import {
@@ -60,57 +71,27 @@ import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import packageJson from "../package.json" with { type: "json" };
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
-export const CLAUDE_CONFIG_DIR = process.env.CLAUDE ?? path.join(os.homedir(), ".claude");
+export const CLAUDE_CONFIG_DIR =
+  process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 
-// ==================== 超时配置 ====================
-// 可通过环境变量覆盖默认值
+function sessionFilePath(cwd: string, sessionId: string): string {
+  return path.join(CLAUDE_CONFIG_DIR, "projects", encodeProjectPath(cwd), `${sessionId}.jsonl`);
+}
 
-/** 获取模型列表超时时间（毫秒），默认 30 秒 */
-const MODEL_FETCH_TIMEOUT_MS = parseInt(process.env.ACP_MODEL_FETCH_TIMEOUT_MS || "30000", 10);
+const MAX_TITLE_LENGTH = 128;
 
-/** 获取命令列表超时时间（毫秒），默认 30 秒 */
-const COMMAND_FETCH_TIMEOUT_MS = parseInt(process.env.ACP_COMMAND_FETCH_TIMEOUT_MS || "30000", 10);
-
-/** 超时后是否使用默认值继续（而不是抛出错误），默认 true */
-const USE_DEFAULTS_ON_TIMEOUT = process.env.ACP_USE_DEFAULTS_ON_TIMEOUT !== "false";
-
-/**
- * 为 Promise 添加超时保护
- * @param promise 要执行的 Promise
- * @param timeoutMs 超时时间（毫秒）
- * @param operationName 操作名称（用于日志）
- * @param logger 日志记录器
- * @returns Promise 执行结果
- */
-async function withTimeout<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-  operationName: string,
-  logger: Logger = console,
-): Promise<T> {
-  const start = Date.now();
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    setTimeout(() => {
-      const elapsed = Date.now() - start;
-      logger.error(`⏰ [ACP] ${operationName} 超时 (${timeoutMs}ms), 实际耗时: ${elapsed}ms`);
-      reject(new Error(`${operationName} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-  });
-
-  try {
-    const result = await Promise.race([promise, timeoutPromise]);
-    const elapsed = Date.now() - start;
-    if (elapsed > 5000) {
-      logger.log(`⚠️ [ACP] ${operationName} 耗时较长: ${elapsed}ms`);
-    } else {
-      logger.log(`✓ [ACP] ${operationName} 完成, 耗时: ${elapsed}ms`);
-    }
-    return result;
-  } catch (error) {
-    throw error;
+function sanitizeTitle(text: string): string {
+  // Replace newlines and collapse whitespace
+  const sanitized = text
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (sanitized.length <= MAX_TITLE_LENGTH) {
+    return sanitized;
   }
+  return sanitized.slice(0, MAX_TITLE_LENGTH - 1) + "…";
 }
 
 /**
@@ -127,6 +108,17 @@ type Session = {
   cancelled: boolean;
   permissionMode: PermissionMode;
   settingsManager: SettingsManager;
+};
+
+type SessionHistoryEntry = {
+  type?: string;
+  isSidechain?: boolean;
+  sessionId?: string;
+  message?: {
+    role?: string;
+    content?: unknown;
+    model?: string;
+  };
 };
 
 type BackgroundTerminal =
@@ -157,6 +149,7 @@ export type NewSessionMeta = {
      * Those parameters will be used and updated to work with ACP:
      *   - hooks (merged with ACP's hooks)
      *   - mcpServers (merged with ACP's mcpServers)
+     *   - disallowedTools (merged with ACP's disallowedTools)
      */
     options?: Options;
   };
@@ -174,17 +167,18 @@ export type ToolUpdateMeta = {
   };
 };
 
-type ToolUseCache = {
+export type ToolUseCache = {
   [key: string]: {
     type: "tool_use" | "server_tool_use" | "mcp_tool_use";
     id: string;
     name: string;
-    input: any;
+    input: unknown;
   };
 };
 
 // Bypass Permissions doesn't work if we are a root/sudo user
 const IS_ROOT = (process.geteuid?.() ?? process.getuid?.()) === 0;
+const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 
 // Implement the ACP Agent interface
 export class ClaudeAcpAgent implements Agent {
@@ -215,17 +209,17 @@ export class ClaudeAcpAgent implements Agent {
     };
 
     // If client supports terminal-auth capability, use that instead.
-    // if (request.clientCapabilities?._meta?.["terminal-auth"] === true) {
-    //   const cliPath = fileURLToPath(import.meta.resolve("@anthropic-ai/claude-agent-sdk/cli.js"));
+    if (request.clientCapabilities?._meta?.["terminal-auth"] === true) {
+      const cliPath = fileURLToPath(import.meta.resolve("@anthropic-ai/claude-agent-sdk/cli.js"));
 
-    //   authMethod._meta = {
-    //     "terminal-auth": {
-    //       command: "node",
-    //       args: [cliPath, "/login"],
-    //       label: "Claude Code Login",
-    //     },
-    //   };
-    // }
+      authMethod._meta = {
+        "terminal-auth": {
+          command: "node",
+          args: [cliPath, "/login"],
+          label: "Claude Code Login",
+        },
+      };
+    }
 
     return {
       protocolVersion: 1,
@@ -238,8 +232,10 @@ export class ClaudeAcpAgent implements Agent {
           http: true,
           sse: true,
         },
+        loadSession: true,
         sessionCapabilities: {
           fork: {},
+          list: {},
           resume: {},
         },
       },
@@ -295,6 +291,195 @@ export class ClaudeAcpAgent implements Agent {
     return response;
   }
 
+  async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    try {
+      await fs.promises.access(sessionFilePath(params.cwd, params.sessionId));
+    } catch {
+      throw new Error("Session not found");
+    }
+
+    const response = await this.createSession(
+      {
+        cwd: params.cwd,
+        mcpServers: params.mcpServers ?? [],
+        _meta: params._meta,
+      },
+      {
+        resume: params.sessionId,
+      },
+    );
+
+    await this.replaySessionHistory(params.sessionId, params.cwd);
+
+    return {
+      modes: response.modes,
+      models: response.models,
+    };
+  }
+
+  /**
+   * List Claude Code sessions by parsing JSONL files
+   * Sessions are stored in ~/.claude/projects/<path-encoded>/
+   * Implements the draft session/list RFD spec
+   */
+  async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+    // Note: We load all sessions into memory for sorting, so pagination here is for
+    // API response size limits rather than memory efficiency. This matches the RFD spec.
+    const PAGE_SIZE = 50;
+    const claudeDir = path.join(CLAUDE_CONFIG_DIR, "projects");
+
+    try {
+      await fs.promises.access(claudeDir);
+    } catch {
+      return { sessions: [] };
+    }
+
+    // Collect all sessions across all project directories
+    const allSessions: SessionInfo[] = [];
+    const encodedCwdFilter = params.cwd ? encodeProjectPath(params.cwd) : null;
+
+    try {
+      const projectDirs = await fs.promises.readdir(claudeDir);
+
+      for (const encodedPath of projectDirs) {
+        const projectDir = path.join(claudeDir, encodedPath);
+        const stat = await fs.promises.stat(projectDir);
+        if (!stat.isDirectory()) continue;
+
+        // Path encoding is not always reversible (hyphens can be separators or literals),
+        // so only use encoded value as a coarse pre-filter.
+        if (encodedCwdFilter && encodedPath !== encodedCwdFilter) continue;
+
+        const files = await fs.promises.readdir(projectDir);
+        // Filter to user session files only. Skip agent-*.jsonl files which contain
+        // internal agent metadata and system logs, not user-visible conversation sessions.
+        const jsonlFiles = files.filter((f) => f.endsWith(".jsonl") && !f.startsWith("agent-"));
+
+        for (const file of jsonlFiles) {
+          const filePath = path.join(projectDir, file);
+          try {
+            const content = await fs.promises.readFile(filePath, "utf-8");
+            const lines = content.trim().split("\n").filter(Boolean);
+
+            const sessionId = file.replace(".jsonl", "");
+            let parsedAnyEntry = false;
+            let sessionCwd: string | undefined;
+
+            // Find first user message for title
+            let title: string | undefined;
+            for (const line of lines) {
+              try {
+                const entry = JSON.parse(line);
+                parsedAnyEntry = true;
+                if (entry.isSidechain === true) {
+                  continue;
+                }
+                const entrySessionId =
+                  typeof entry.sessionId === "string" ? entry.sessionId : undefined;
+                if (typeof entry.sessionId === "string" && entry.sessionId !== entrySessionId) {
+                  continue;
+                }
+                if (typeof entry.cwd === "string") {
+                  sessionCwd = entry.cwd;
+                }
+                if (!title && entry.type === "user" && entry.message?.content) {
+                  const msgContent = entry.message.content;
+                  if (typeof msgContent === "string") {
+                    title = sanitizeTitle(msgContent);
+                  }
+                  if (Array.isArray(msgContent) && msgContent.length > 0) {
+                    const first = msgContent[0];
+                    const text =
+                      typeof first === "string"
+                        ? first
+                        : first && typeof first === "object" && typeof first.text === "string"
+                          ? first.text
+                          : undefined;
+                    if (text) {
+                      title = sanitizeTitle(text);
+                    }
+                  }
+                }
+
+                // Continue scanning until we have both fields, since cwd can appear
+                // in later entries even after the first user title-bearing message.
+                if (title && sessionCwd) {
+                  break;
+                }
+              } catch {
+                // Skip malformed lines
+              }
+            }
+            if (!parsedAnyEntry) continue;
+
+            // SessionInfo.cwd is currently required. For entries that do not
+            // include an explicit cwd in the session JSONL (typically metadata-only files),
+            // we skip them instead of decoding folder names because path encoding is lossy.
+            if (!sessionCwd) continue;
+
+            // Even after encoded-path pre-filtering, verify per-entry cwd to disambiguate
+            // collisions such as "/a-b" and "/a/b" that map to the same encoded folder name.
+            if (params.cwd && sessionCwd !== params.cwd) continue;
+
+            // Get file modification time as updatedAt
+            const fileStat = await fs.promises.stat(filePath);
+            const updatedAt = fileStat.mtime.toISOString();
+
+            allSessions.push({
+              sessionId,
+              cwd: sessionCwd,
+              title: title ?? null,
+              updatedAt,
+            });
+          } catch (err) {
+            this.logger.error(
+              `[unstable_listSessions] Failed to parse session file: ${filePath}`,
+              err,
+            );
+          }
+        }
+      }
+    } catch (err) {
+      this.logger.error("[unstable_listSessions] Failed to list sessions", err);
+      return { sessions: [] };
+    }
+
+    // Sort by updatedAt descending (most recent first)
+    allSessions.sort((a, b) => {
+      const timeA = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+      const timeB = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+      return timeB - timeA;
+    });
+
+    // Handle pagination with cursor
+    let startIndex = 0;
+    if (params.cursor) {
+      try {
+        const decoded = Buffer.from(params.cursor, "base64").toString("utf-8");
+        const cursorData = JSON.parse(decoded);
+        startIndex = cursorData.offset ?? 0;
+      } catch {
+        // Invalid cursor, start from beginning
+      }
+    }
+
+    const pageOfSessions = allSessions.slice(startIndex, startIndex + PAGE_SIZE);
+    const hasMore = startIndex + PAGE_SIZE < allSessions.length;
+
+    const response: ListSessionsResponse = {
+      sessions: pageOfSessions,
+    };
+
+    if (hasMore) {
+      const nextCursor = Buffer.from(JSON.stringify({ offset: startIndex + PAGE_SIZE })).toString(
+        "base64",
+      );
+      response.nextCursor = nextCursor;
+    }
+
+    return response;
+  }
+
   async authenticate(_params: AuthenticateRequest): Promise<void> {
     throw new Error("Method not implemented.");
   }
@@ -324,8 +509,12 @@ export class ClaudeAcpAgent implements Agent {
             case "init":
               break;
             case "compact_boundary":
+            case "hook_started":
+            case "task_notification":
+            case "hook_progress":
             case "hook_response":
             case "status":
+            case "files_persisted":
               // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
               break;
             default:
@@ -396,6 +585,21 @@ export class ClaudeAcpAgent implements Agent {
             typeof message.message.content === "string" &&
             message.message.content.includes("<local-command-stdout>")
           ) {
+            // Handle /context by sending its reply as regular agent message.
+            if (message.message.content.includes("Context Usage")) {
+              for (const notification of toAcpNotifications(
+                message.message.content
+                  .replace("<local-command-stdout>", "")
+                  .replace("</local-command-stdout>", ""),
+                "assistant",
+                params.sessionId,
+                this.toolUseCache,
+                this.client,
+                this.logger,
+              )) {
+                await this.client.sessionUpdate(notification);
+              }
+            }
             this.logger.log(message.message.content);
             break;
           }
@@ -448,6 +652,7 @@ export class ClaudeAcpAgent implements Agent {
           break;
         }
         case "tool_progress":
+        case "tool_use_summary":
           break;
         case "auth_status":
           break;
@@ -499,6 +704,71 @@ export class ClaudeAcpAgent implements Agent {
         return {};
       default:
         throw new Error("Invalid Mode");
+    }
+  }
+
+  private async replaySessionHistory(sessionId: string, cwd: string): Promise<void> {
+    const filePath = sessionFilePath(cwd, sessionId);
+    const toolUseCache: ToolUseCache = {};
+    const stream = fs.createReadStream(filePath, { encoding: "utf-8" });
+    const reader = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+    try {
+      for await (const line of reader) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+
+        let entry: SessionHistoryEntry;
+        try {
+          entry = JSON.parse(trimmed) as SessionHistoryEntry;
+        } catch {
+          continue;
+        }
+
+        if (entry.type !== "user" && entry.type !== "assistant") {
+          continue;
+        }
+
+        if (entry.isSidechain) {
+          continue;
+        }
+
+        if (entry.sessionId && entry.sessionId !== sessionId) {
+          continue;
+        }
+
+        const message = entry.message;
+        if (!message) {
+          continue;
+        }
+
+        const role =
+          message.role === "assistant" ? "assistant" : message.role === "user" ? "user" : null;
+        if (!role) {
+          continue;
+        }
+
+        const content = message.content;
+        if (typeof content !== "string" && !Array.isArray(content)) {
+          continue;
+        }
+
+        for (const notification of toAcpNotifications(
+          content,
+          role,
+          sessionId,
+          toolUseCache,
+          this.client,
+          this.logger,
+          { registerHooks: false },
+        )) {
+          await this.client.sessionUpdate(notification);
+        }
+      }
+    } finally {
+      reader.close();
     }
   }
 
@@ -714,11 +984,6 @@ export class ClaudeAcpAgent implements Agent {
 
     // Extract options from _meta if provided
     const userProvidedOptions = (params._meta as NewSessionMeta | undefined)?.claudeCode?.options;
-    const extraArgs = { ...userProvidedOptions?.extraArgs };
-    if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
-      // Set our own session id if not resuming an existing session.
-      extraArgs["session-id"] = sessionId;
-    }
 
     // Configure thinking tokens from environment variable
     const maxThinkingTokens = process.env.MAX_THINKING_TOKENS
@@ -735,10 +1000,9 @@ export class ClaudeAcpAgent implements Agent {
       cwd: params.cwd,
       includePartialMessages: true,
       mcpServers: { ...(userProvidedOptions?.mcpServers || {}), ...mcpServers },
-      extraArgs,
       // If we want bypassPermissions to be an option, we have to allow it here.
       // But it doesn't work in root mode, so we only activate it if it will work.
-      allowDangerouslySkipPermissions: !IS_ROOT,
+      allowDangerouslySkipPermissions: ALLOW_BYPASS,
       permissionMode,
       canUseTool: this.canUseTool(sessionId),
       // note: although not documented by the types, passing an absolute path
@@ -759,12 +1023,33 @@ export class ClaudeAcpAgent implements Agent {
         PostToolUse: [
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {
-            hooks: [createPostToolUseHook(this.logger)],
+            hooks: [
+              createPostToolUseHook(this.logger, {
+                onEnterPlanMode: async () => {
+                  const session = this.sessions[sessionId];
+                  if (session) {
+                    session.permissionMode = "plan";
+                  }
+                  await this.client.sessionUpdate({
+                    sessionId,
+                    update: {
+                      sessionUpdate: "current_mode_update",
+                      currentModeId: "plan",
+                    },
+                  });
+                },
+              }),
+            ],
           },
         ],
       },
       ...creationOpts,
     };
+
+    if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
+      // Set our own session id if not resuming an existing session.
+      options.sessionId = sessionId;
+    }
 
     const allowedTools = [];
     // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
@@ -818,7 +1103,7 @@ export class ClaudeAcpAgent implements Agent {
       options.allowedTools = allowedTools;
     }
     if (disallowedTools.length > 0) {
-      options.disallowedTools = disallowedTools;
+      options.disallowedTools = [...(options.disallowedTools || []), ...disallowedTools];
     }
 
     // Handle abort controller from meta options
@@ -850,63 +1135,15 @@ export class ClaudeAcpAgent implements Agent {
       settingsManager,
     };
 
-    this.logger.log(`📋 [ACP] 开始获取可用命令和模型...`);
-
-    // 使用超时保护包装命令获取
-    let availableCommands: AvailableCommand[] = [];
-    // try {
-    //   availableCommands = await withTimeout(
-    //     getAvailableSlashCommands(q, this.logger),
-    //     COMMAND_FETCH_TIMEOUT_MS,
-    //     "getAvailableSlashCommands",
-    //     this.logger,
-    //   );
-    // } catch (error) {
-    //   if (USE_DEFAULTS_ON_TIMEOUT) {
-    //     this.logger.log(`⚠️ [ACP] 获取命令失败，使用空列表: ${error}`);
-    //     availableCommands = [];
-    //   } else {
-    //     throw error;
-    //   }
-    // }
-
-    // 使用超时保护包装模型获取
-    let models: SessionModelState = {
+    // 跳过远程拉取模型列表和斜杠命令，直接使用空默认值
+    this.logger.log(`📋 [ACP] 跳过 initializationResult (不需要远程拉取模型/命令)`);
+    const models: SessionModelState = {
       availableModels: [],
       currentModelId: "",
     };
-    // try {
-    //   models = await withTimeout(
-    //     getAvailableModels(q, this.logger),
-    //     MODEL_FETCH_TIMEOUT_MS,
-    //     "getAvailableModels",
-    //     this.logger,
-    //   );
-    // } catch (error) {
-    //   if (USE_DEFAULTS_ON_TIMEOUT) {
-    //     this.logger.log(`⚠️ [ACP] 获取模型失败，使用默认值: ${error}`);
-    //     models = {
-    //       availableModels: [],
-    //       currentModelId: "",
-    //     };
-    //   } else {
-    //     throw error;
-    //   }
-    // }
 
     const sessionCreateElapsed = Date.now() - sessionCreateStartTime;
     this.logger.log(`✅ [ACP] 会话创建完成, 总耗时: ${sessionCreateElapsed}ms`);
-
-    // Needs to happen after we return the session
-    setTimeout(() => {
-      this.client.sessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "available_commands_update",
-          availableCommands,
-        },
-      });
-    }, 0);
 
     const availableModes = [
       {
@@ -931,7 +1168,7 @@ export class ClaudeAcpAgent implements Agent {
       },
     ];
     // Only works in non-root mode
-    if (!IS_ROOT) {
+    if (ALLOW_BYPASS) {
       availableModes.push({
         id: "bypassPermissions",
         name: "Bypass Permissions",
@@ -948,72 +1185,6 @@ export class ClaudeAcpAgent implements Agent {
       },
     };
   }
-}
-
-async function getAvailableModels(query: Query, logger: Logger = console): Promise<SessionModelState> {
-  const startTime = Date.now();
-  logger.log(`   📋 [ACP] 开始获取可用模型列表...`);
-
-  const models = await query.supportedModels();
-  logger.log(`   📋 [ACP] 获取到 ${models.length} 个模型, 耗时: ${Date.now() - startTime}ms`);
-
-  // Query doesn't give us access to the currently selected model, so we just choose the first model in the list.
-  if (models.length === 0) {
-    logger.log(`   ⚠️ [ACP] 没有可用模型`);
-    return { availableModels: [], currentModelId: "" };
-  }
-
-  const currentModel = models[0];
-  await query.setModel(currentModel.value);
-
-  const availableModels = models.map((model) => ({
-    modelId: model.value,
-    name: model.displayName,
-    description: model.description,
-  }));
-
-  return {
-    availableModels,
-    currentModelId: currentModel.value,
-  };
-}
-
-async function getAvailableSlashCommands(query: Query, logger: Logger = console): Promise<AvailableCommand[]> {
-  const startTime = Date.now();
-  logger.log(`   📋 [ACP] 开始获取可用斜杠命令...`);
-
-  const UNSUPPORTED_COMMANDS = [
-    "context",
-    "cost",
-    "login",
-    "logout",
-    "output-style:new",
-    "release-notes",
-    "todos",
-  ];
-  const commands = await query.supportedCommands();
-  logger.log(`   📋 [ACP] 获取到 ${commands.length} 个斜杠命令, 耗时: ${Date.now() - startTime}ms`);
-
-  return commands
-    .map((command) => {
-      const input = command.argumentHint
-        ? {
-            hint: Array.isArray(command.argumentHint)
-              ? command.argumentHint.join(" ")
-              : command.argumentHint,
-          }
-        : null;
-      let name = command.name;
-      if (command.name.endsWith(" (MCP)")) {
-        name = `mcp:${name.replace(" (MCP)", "")}`;
-      }
-      return {
-        name,
-        description: command.description || "",
-        input,
-      };
-    })
-    .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
 }
 
 function formatUriAsLink(uri: string): string {
@@ -1123,7 +1294,9 @@ export function toAcpNotifications(
   toolUseCache: ToolUseCache,
   client: AgentSideConnection,
   logger: Logger,
+  options?: { registerHooks?: boolean },
 ): SessionNotification[] {
+  const registerHooks = options?.registerHooks !== false;
   if (typeof content === "string") {
     return [
       {
@@ -1188,32 +1361,33 @@ export function toAcpNotifications(
             };
           }
         } else {
-          // Register hook callback to receive the structured output from the hook
-          registerHookCallback(chunk.id, {
-            onPostToolUseHook: async (toolUseId, toolInput, toolResponse) => {
-              const toolUse = toolUseCache[toolUseId];
-              if (toolUse) {
-                const update: SessionNotification["update"] = {
-                  _meta: {
-                    claudeCode: {
-                      toolResponse,
-                      toolName: toolUse.name,
-                    },
-                  } satisfies ToolUpdateMeta,
-                  toolCallId: toolUseId,
-                  sessionUpdate: "tool_call_update",
-                };
-                await client.sessionUpdate({
-                  sessionId,
-                  update,
-                });
-              } else {
-                logger.error(
-                  `[claude-code-acp] Got a tool response for tool use that wasn't tracked: ${toolUseId}`,
-                );
-              }
-            },
-          });
+          if (registerHooks) {
+            registerHookCallback(chunk.id, {
+              onPostToolUseHook: async (toolUseId, toolInput, toolResponse) => {
+                const toolUse = toolUseCache[toolUseId];
+                if (toolUse) {
+                  const update: SessionNotification["update"] = {
+                    _meta: {
+                      claudeCode: {
+                        toolResponse,
+                        toolName: toolUse.name,
+                      },
+                    } satisfies ToolUpdateMeta,
+                    toolCallId: toolUseId,
+                    sessionUpdate: "tool_call_update",
+                  };
+                  await client.sessionUpdate({
+                    sessionId,
+                    update,
+                  });
+                } else {
+                  logger.error(
+                    `[claude-code-acp] Got a tool response for tool use that wasn't tracked: ${toolUseId}`,
+                  );
+                }
+              },
+            });
+          }
 
           let rawInput;
           try {
@@ -1263,6 +1437,7 @@ export function toAcpNotifications(
             toolCallId: chunk.tool_use_id,
             sessionUpdate: "tool_call_update",
             status: "is_error" in chunk && chunk.is_error ? "failed" : "completed",
+            rawOutput: chunk.content,
             ...toolUpdateFromToolResult(chunk, toolUseCache[chunk.tool_use_id]),
           };
         }
@@ -1276,6 +1451,8 @@ export function toAcpNotifications(
       case "citations_delta":
       case "signature_delta":
       case "container_upload":
+      case "compaction":
+      case "compaction_delta":
         break;
 
       default:

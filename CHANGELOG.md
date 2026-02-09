@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.16.0
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.34
+- Experimental support for session loading
+
+## 0.15.0
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.32 (adds support for Opus 4.6 and 1M context Opus)
+
+## 0.14.0
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.29
+- Update to using the recommended `CLAUDE_CONFIG_DIR` env variable for setting where config files are kept
+- Support /context command
+- Fix incorrect context type mapping for tool calls
+- Fix glob metching for file permissions on Windows
+- Support the `IS_SANDBOX` env var for supporting bypass permissions in root mode
+- Fix missing notification for entering plan mode
+- Experimental unstable support for listing sessions
+
+## 0.13.2
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.22
+- Fix: return content from ACP write tool to help with issues with alternate providers.
+
 ## 0.13.1
 
 - Update to @anthropic-ai/claude-agent-sdk@0.2.7
