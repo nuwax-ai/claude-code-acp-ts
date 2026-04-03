@@ -1,5 +1,130 @@
 # Changelog
 
+## [0.24.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.24.1...v0.24.2) (2026-03-27)
+
+
+### Bug Fixes
+
+* Add explicit type checks for MCP servers (http/sse) ([#487](https://github.com/agentclientprotocol/claude-agent-acp/issues/487)) ([e00a439](https://github.com/agentclientprotocol/claude-agent-acp/commit/e00a43901fa2b4fd7d582e1de57277be88233007))
+
+## [0.24.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.24.0...v0.24.1) (2026-03-26)
+
+
+### Bug Fixes
+
+* Cleanup based on new idle state [#463](https://github.com/agentclientprotocol/claude-agent-acp/issues/463) ([#480](https://github.com/agentclientprotocol/claude-agent-acp/issues/480)) ([23b3073](https://github.com/agentclientprotocol/claude-agent-acp/commit/23b30730253752f0bc4e30b619a6236f16fafdb9))
+
+## 0.24.0
+
+Rename from `@zed-industries/claude-agent-acp` to `@agentclientprotocol/claude-agent-acp`.
+
+We are moving this to the main ACP org to better allow multiple teams to contribute and maintain this adapter.
+
+## 0.23.1
+
+- Add back error_during_execution break point (#469)
+
+## 0.23.0
+
+- Use idle session state as end of turn (#463)
+- Update claude-agent-sdk to 0.2.83 (#462)
+- Fix handling of local-only slash commands (#432)
+- fix: correct null check for gatewayAuthMeta in subscription validation (#455)
+- fix: include both stdout and stderr in Bash tool output (#456)
+- fix: prevent prompt loop hang when cancel races with first result (#458)
+- fix: dispose SettingsManager on session close to prevent resource leaks (#454)
+- fix: restore plan content in ExitPlanMode tool call (#451)
+
+## 0.22.2
+
+- Add experimental meta param for testing additional directories
+
+## 0.22.1
+
+- Fix: invalid auth required state in gateway mode
+
+## 0.22.0
+
+- Use stable list sessions method (#429)
+- Use correct Claude CLI path for static binaries (#428)
+- Update claude-agent-sdk to 0.2.76 (#427)
+- fix: resolve model aliases in setSessionConfigOption (#401) (#403)
+- Reuse existing sessions for load/resume if possible (#426)
+- Remove interrupt flag from deny responses (#425)
+- Allow Bypass permissions mode after Exiting plan (#410)
+- Don't get out of sync when background task creates new init/result (try 2) (#400)
+- Add session/close support (#409)
+
+## 0.21.0
+
+- Update to claude-agent-sdk 0.2.71
+- show project-relative paths in tool call titles
+- Lib: pass through tools array to control built-in tool availability
+- fix: skip user replay
+- fix: handle renamed Agent tool in toolInfoFromToolUse
+
+## 0.20.2
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.68
+
+## 0.20.1
+
+- fix: inherit process.env when spawning agent subprocess
+
+## 0.20.0
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.63
+- Respect user settings for permission mode and model selection
+- Better handling of concurrent prompts
+- Support --cli for node as well
+- Propagate max_tokens stop reason instead of throwing internal error
+- fix: throw resourceNotFound when loadSession fails to resume
+- fix: add missing zod dependency
+- Surface better error message when Claude Code process exits unexpectedly
+
+## 0.19.2
+
+- Fix for broken notifications when reloading session messages
+
+## 0.19.1
+
+- Support windows arm builds and clean up artifact files
+
+## 0.19.0
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.62
+- Use SDK functions for listing and loading session history
+- Build single-file executables using bun.
+- Fix for overwritten disallowed tools.
+
+## 0.18.0
+
+- Switch over to built-in Claude tools. We no longer replicate specific ACP tools and just rely on sending updates based on Claude's internal tools. This means it won't use client capabilities for files or terminals, but also means there will be less difference and hopefully issues arising from the differences in behavior.
+- Support ACP session config options: https://agentclientprotocol.com/protocol/session-config-options
+- Fix for image output from tool calls.
+
+## 0.17.1
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.45 to add access to Sonnet 4.6
+
+## 0.17.0
+
+Rename from `@zed-industries/claude-code-acp` to `@zed-industries/claude-agent-acp` to align with the current [branding guidelines](https://platform.claude.com/docs/en/agent-sdk/overview#branding-guidelines)
+
+## 0.16.2
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.44
+- fix: Replace all non-alphanumeric characters for session loading in encodeProjectPath (#307)
+- don't include /login slash command in login command (#315)
+
+## 0.16.1
+
+- Update to @anthropic-ai/claude-agent-sdk@0.2.38
+- Fix incorrect paths for session/list
+- Fix available commands after loading a session
+- Make loading session more permissive for finding events
+- Fix overriding user-provided disallowedTools
+
 ## 0.16.0
 
 - Update to @anthropic-ai/claude-agent-sdk@0.2.34

@@ -4,7 +4,7 @@
 
 > **Note**: This is a fork of [@zed-industries/claude-code-acp](https://github.com/zed-industries/claude-code-acp), maintained by [nuwax-ai](https://github.com/nuwax-ai).
 
-Use [Claude Code](https://www.anthropic.com/claude-code) from [ACP-compatible](https://agentclientprotocol.com) clients such as [Zed](https://zed.dev)!
+Use [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview#branding-guidelines) from [ACP-compatible](https://agentclientprotocol.com) clients!
 
 This tool implements an ACP agent by using the official [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview), supporting:
 
@@ -20,9 +20,9 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
-## How to use
+## Contribution Policy
 
-### Zed
+This project does not require a Contributor License Agreement (CLA). Instead, contributions are accepted under the following terms:
 
 The latest version of Zed can already use this adapter out of the box.
 
