@@ -1687,7 +1687,16 @@ async function getAvailableModels(
 
   let currentModel = models[0];
 
-  if (settings.model) {
+  // 模型优先级（从高到低）：
+  // 1. ANTHROPIC_MODEL 环境变量（用户期望的最高优先级）
+  // 2. settings.model（用户配置文件）
+  // 3. models[0]（默认使用第一个模型）
+  if (process.env.ANTHROPIC_MODEL) {
+    const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
+    if (match) {
+      currentModel = match;
+    }
+  } else if (settings.model) {
     const match = resolveModelPreference(models, settings.model);
     if (match) {
       currentModel = match;
