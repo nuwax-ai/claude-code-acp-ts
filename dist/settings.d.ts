@@ -10,22 +10,12 @@
  * Docs: https://code.claude.com/docs/en/iam#tool-specific-permission-rules
  */
 export interface PermissionSettings {
-    allow?: string[];
-    deny?: string[];
-    ask?: string[];
-    additionalDirectories?: string[];
     defaultMode?: string;
 }
 export interface ClaudeCodeSettings {
     permissions?: PermissionSettings;
     env?: Record<string, string>;
     model?: string;
-}
-export type PermissionDecision = "allow" | "deny" | "ask";
-export interface PermissionCheckResult {
-    decision: PermissionDecision;
-    rule?: string;
-    source?: "allow" | "deny" | "ask";
 }
 /**
  * Gets the enterprise settings path based on the current platform
@@ -60,7 +50,9 @@ export declare class SettingsManager {
     private onChange?;
     private logger;
     private initialized;
+    private disposed;
     private debounceTimer;
+    private initPromise;
     constructor(cwd: string, options?: SettingsManagerOptions);
     /**
      * Initialize the settings manager by loading all settings and setting up file watchers
@@ -96,14 +88,6 @@ export declare class SettingsManager {
      * Handles settings file changes with debouncing to avoid rapid reloads
      */
     private handleSettingsChange;
-    /**
-     * Checks if a tool invocation is allowed based on the loaded settings.
-     *
-     * @param toolName - The tool name (can be ACP-prefixed like mcp__acp__Read or plain like Read)
-     * @param toolInput - The tool input object
-     * @returns The permission decision and matching rule info
-     */
-    checkPermission(toolName: string, toolInput: unknown): PermissionCheckResult;
     /**
      * Returns the current merged settings
      */

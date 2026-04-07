@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.24.3](https://github.com/dongdada29/claude-code-acp-ts/compare/v0.24.2...v0.24.3) (2026-04-03)
+
+### Features
+
+* Enhance model selection priority in `getAvailableModels`.
+
+### Bug Fixes
+
+* Use the current model's context window for `usage_update` size ([#412](https://github.com/agentclientprotocol/claude-agent-acp/issues/412)).
+* Prevent race conditions in `SettingsManager` `setCwd` and debounce ([#485](https://github.com/agentclientprotocol/claude-agent-acp/issues/485)).
+* Log warnings for malformed settings files instead of silent fallback ([#486](https://github.com/agentclientprotocol/claude-agent-acp/issues/486)).
+
 ## [0.24.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.24.1...v0.24.2) (2026-03-27)
 
 

@@ -1,32 +1,28 @@
-import { SYSTEM_REMINDER } from "./mcp-server.js";
-import * as diff from "diff";
-const acpUnqualifiedToolNames = {
-    read: "Read",
-    edit: "Edit",
-    write: "Write",
-    bash: "Bash",
-    killShell: "KillShell",
-    bashOutput: "BashOutput",
-};
-export const ACP_TOOL_NAME_PREFIX = "mcp__acp__";
-export const acpToolNames = {
-    read: ACP_TOOL_NAME_PREFIX + acpUnqualifiedToolNames.read,
-    edit: ACP_TOOL_NAME_PREFIX + acpUnqualifiedToolNames.edit,
-    write: ACP_TOOL_NAME_PREFIX + acpUnqualifiedToolNames.write,
-    bash: ACP_TOOL_NAME_PREFIX + acpUnqualifiedToolNames.bash,
-    killShell: ACP_TOOL_NAME_PREFIX + acpUnqualifiedToolNames.killShell,
-    bashOutput: ACP_TOOL_NAME_PREFIX + acpUnqualifiedToolNames.bashOutput,
-};
-export const EDIT_TOOL_NAMES = [acpToolNames.edit, acpToolNames.write];
-export function toolInfoFromToolUse(toolUse) {
+import path from "node:path";
+/**
+ * Convert an absolute file path to a project-relative path for display.
+ * Returns the original path if it's outside the project directory or if no cwd is provided.
+ */
+export function toDisplayPath(filePath, cwd) {
+    if (!cwd)
+        return filePath;
+    const resolvedCwd = path.resolve(cwd);
+    const resolvedFile = path.resolve(filePath);
+    if (resolvedFile.startsWith(resolvedCwd + path.sep) || resolvedFile === resolvedCwd) {
+        return path.relative(resolvedCwd, resolvedFile);
+    }
+    return filePath;
+}
+export function toolInfoFromToolUse(toolUse, supportsTerminalOutput = false, cwd) {
     const name = toolUse.name;
-    const input = toolUse.input;
     switch (name) {
-        case "Task":
+        case "Agent":
+        case "Task": {
+            const input = toolUse.input;
             return {
                 title: input?.description ? input.description : "Task",
                 kind: "think",
-                content: input && input.prompt
+                content: input && "prompt" in input
                     ? [
                         {
                             type: "content",
@@ -35,119 +31,50 @@ export function toolInfoFromToolUse(toolUse) {
                     ]
                     : [],
             };
-        case "NotebookRead":
+        }
+        case "Bash": {
+            const input = toolUse.input;
             return {
-                title: input?.notebook_path ? `Read Notebook ${input.notebook_path}` : "Read Notebook",
-                kind: "read",
-                content: [],
-                locations: input?.notebook_path ? [{ path: input.notebook_path }] : [],
-            };
-        case "NotebookEdit":
-            return {
-                title: input?.notebook_path ? `Edit Notebook ${input.notebook_path}` : "Edit Notebook",
-                kind: "edit",
-                content: input && input.new_source
-                    ? [
-                        {
-                            type: "content",
-                            content: { type: "text", text: input.new_source },
-                        },
-                    ]
-                    : [],
-                locations: input?.notebook_path ? [{ path: input.notebook_path }] : [],
-            };
-        case "Bash":
-        case acpToolNames.bash:
-            return {
-                title: input?.command ? "`" + input.command.replaceAll("`", "\\`") + "`" : "Terminal",
+                title: input?.command ? input.command : "Terminal",
                 kind: "execute",
-                content: input && input.description
-                    ? [
-                        {
-                            type: "content",
-                            content: { type: "text", text: input.description },
-                        },
-                    ]
-                    : [],
+                content: supportsTerminalOutput
+                    ? [{ type: "terminal", terminalId: toolUse.id }]
+                    : input && input.description
+                        ? [
+                            {
+                                type: "content",
+                                content: { type: "text", text: input.description },
+                            },
+                        ]
+                        : [],
             };
-        case "BashOutput":
-        case acpToolNames.bashOutput:
-            return {
-                title: "Tail Logs",
-                kind: "execute",
-                content: [],
-            };
-        case "KillShell":
-        case acpToolNames.killShell:
-            return {
-                title: "Kill Process",
-                kind: "execute",
-                content: [],
-            };
-        case acpToolNames.read: {
+        }
+        case "Read": {
+            const input = toolUse.input;
             let limit = "";
-            if (input.limit) {
-                limit =
-                    " (" + ((input.offset ?? 0) + 1) + " - " + ((input.offset ?? 0) + input.limit) + ")";
+            if (input.limit && input.limit > 0) {
+                limit = " (" + (input.offset ?? 1) + " - " + ((input.offset ?? 1) + input.limit - 1) + ")";
             }
             else if (input.offset) {
-                limit = " (from line " + (input.offset + 1) + ")";
+                limit = " (from line " + input.offset + ")";
             }
+            const displayPath = input.file_path ? toDisplayPath(input.file_path, cwd) : "File";
             return {
-                title: "Read " + (input.file_path ?? "File") + limit,
+                title: "Read " + displayPath + limit,
                 kind: "read",
                 locations: input.file_path
                     ? [
                         {
                             path: input.file_path,
-                            line: input.offset ?? 0,
+                            line: input.offset ?? 1,
                         },
                     ]
                     : [],
                 content: [],
             };
         }
-        case "Read":
-            return {
-                title: "Read File",
-                kind: "read",
-                content: [],
-                locations: input.file_path
-                    ? [
-                        {
-                            path: input.file_path,
-                            line: input.offset ?? 0,
-                        },
-                    ]
-                    : [],
-            };
-        case "LS":
-            return {
-                title: `List the ${input?.path ? "`" + input.path + "`" : "current"} directory's contents`,
-                kind: "search",
-                content: [],
-                locations: [],
-            };
-        case acpToolNames.edit:
-        case "Edit": {
-            const path = input?.file_path ?? input?.file_path;
-            return {
-                title: path ? `Edit \`${path}\`` : "Edit",
-                kind: "edit",
-                content: input && path
-                    ? [
-                        {
-                            type: "diff",
-                            path,
-                            oldText: input.old_string ?? null,
-                            newText: input.new_string ?? "",
-                        },
-                    ]
-                    : [],
-                locations: path ? [{ path }] : undefined,
-            };
-        }
-        case acpToolNames.write: {
+        case "Write": {
+            const input = toolUse.input;
             let content = [];
             if (input && input.file_path) {
                 content = [
@@ -167,30 +94,37 @@ export function toolInfoFromToolUse(toolUse) {
                     },
                 ];
             }
+            const displayPath = input?.file_path ? toDisplayPath(input.file_path, cwd) : undefined;
             return {
-                title: input?.file_path ? `Write ${input.file_path}` : "Write",
+                title: displayPath ? `Write ${displayPath}` : "Write",
                 kind: "edit",
                 content,
                 locations: input?.file_path ? [{ path: input.file_path }] : [],
             };
         }
-        case "Write":
+        case "Edit": {
+            const input = toolUse.input;
+            let content = [];
+            if (input && input.file_path && (input.old_string || input.new_string)) {
+                content = [
+                    {
+                        type: "diff",
+                        path: input.file_path,
+                        oldText: input.old_string || null,
+                        newText: input.new_string ?? "",
+                    },
+                ];
+            }
+            const displayPath = input?.file_path ? toDisplayPath(input.file_path, cwd) : undefined;
             return {
-                title: input?.file_path ? `Write ${input.file_path}` : "Write",
+                title: displayPath ? `Edit ${displayPath}` : "Edit",
                 kind: "edit",
-                content: input && input.file_path
-                    ? [
-                        {
-                            type: "diff",
-                            path: input.file_path,
-                            oldText: null,
-                            newText: input.content,
-                        },
-                    ]
-                    : [],
+                content,
                 locations: input?.file_path ? [{ path: input.file_path }] : [],
             };
+        }
         case "Glob": {
+            const input = toolUse.input;
             let label = "Find";
             if (input.path) {
                 label += ` \`${input.path}\``;
@@ -206,6 +140,7 @@ export function toolInfoFromToolUse(toolUse) {
             };
         }
         case "Grep": {
+            const input = toolUse.input;
             let label = "grep";
             if (input["-i"]) {
                 label += " -i";
@@ -224,13 +159,13 @@ export function toolInfoFromToolUse(toolUse) {
             }
             if (input.output_mode) {
                 switch (input.output_mode) {
-                    case "FilesWithMatches":
+                    case "files_with_matches":
                         label += " -l";
                         break;
-                    case "Count":
+                    case "count":
                         label += " -c";
                         break;
-                    case "Content":
+                    case "content":
                     default:
                         break;
                 }
@@ -259,7 +194,8 @@ export function toolInfoFromToolUse(toolUse) {
                 content: [],
             };
         }
-        case "WebFetch":
+        case "WebFetch": {
+            const input = toolUse.input;
             return {
                 title: input?.url ? `Fetch ${input.url}` : "Fetch",
                 kind: "fetch",
@@ -272,7 +208,9 @@ export function toolInfoFromToolUse(toolUse) {
                     ]
                     : [],
             };
+        }
         case "WebSearch": {
+            const input = toolUse.input;
             let label = `"${input.query}"`;
             if (input.allowed_domains && input.allowed_domains.length > 0) {
                 label += ` (allowed: ${input.allowed_domains.join(", ")})`;
@@ -286,7 +224,8 @@ export function toolInfoFromToolUse(toolUse) {
                 content: [],
             };
         }
-        case "TodoWrite":
+        case "TodoWrite": {
+            const input = toolUse.input;
             return {
                 title: Array.isArray(input?.todos)
                     ? `Update TODOs: ${input.todos.map((todo) => todo.content).join(", ")}`
@@ -294,15 +233,19 @@ export function toolInfoFromToolUse(toolUse) {
                 kind: "think",
                 content: [],
             };
-        case "ExitPlanMode":
+        }
+        case "ExitPlanMode": {
+            const planInput = toolUse.input;
             return {
                 title: "Ready to code?",
                 kind: "switch_mode",
-                content: input && input.plan
-                    ? [{ type: "content", content: { type: "text", text: input.plan } }]
+                content: planInput?.plan
+                    ? [{ type: "content", content: { type: "text", text: planInput.plan } }]
                     : [],
             };
+        }
         case "Other": {
+            const input = toolUse.input;
             let output;
             try {
                 output = JSON.stringify(input, null, 2);
@@ -332,7 +275,7 @@ export function toolInfoFromToolUse(toolUse) {
             };
     }
 }
-export function toolUpdateFromToolResult(toolResult, toolUse) {
+export function toolUpdateFromToolResult(toolResult, toolUse, supportsTerminalOutput = false) {
     if ("is_error" in toolResult &&
         toolResult.is_error &&
         toolResult.content &&
@@ -342,7 +285,6 @@ export function toolUpdateFromToolResult(toolResult, toolUse) {
     }
     switch (toolUse?.name) {
         case "Read":
-        case acpToolNames.read:
             if (Array.isArray(toolResult.content) && toolResult.content.length > 0) {
                 return {
                     content: toolResult.content.map((content) => ({
@@ -350,9 +292,9 @@ export function toolUpdateFromToolResult(toolResult, toolUse) {
                         content: content.type === "text"
                             ? {
                                 type: "text",
-                                text: markdownEscape(content.text.replace(SYSTEM_REMINDER, "")),
+                                text: markdownEscape(content.text),
                             }
-                            : content,
+                            : toAcpContentBlock(content, false),
                     })),
                 };
             }
@@ -363,83 +305,82 @@ export function toolUpdateFromToolResult(toolResult, toolUse) {
                             type: "content",
                             content: {
                                 type: "text",
-                                text: markdownEscape(toolResult.content.replace(SYSTEM_REMINDER, "")),
+                                text: markdownEscape(toolResult.content),
                             },
                         },
                     ],
                 };
             }
             return {};
-        case acpToolNames.edit: {
-            const content = [];
-            const locations = [];
-            if (Array.isArray(toolResult.content) &&
-                toolResult.content.length > 0 &&
-                "text" in toolResult.content[0] &&
-                typeof toolResult.content[0].text === "string") {
-                const patches = diff.parsePatch(toolResult.content[0].text);
-                console.error(JSON.stringify(patches));
-                for (const { oldFileName, newFileName, hunks } of patches) {
-                    for (const { lines, newStart } of hunks) {
-                        const oldText = [];
-                        const newText = [];
-                        for (const line of lines) {
-                            if (line.startsWith("-")) {
-                                oldText.push(line.slice(1));
-                            }
-                            else if (line.startsWith("+")) {
-                                newText.push(line.slice(1));
-                            }
-                            else {
-                                oldText.push(line.slice(1));
-                                newText.push(line.slice(1));
-                            }
-                        }
-                        if (oldText.length > 0 || newText.length > 0) {
-                            locations.push({ path: newFileName || oldFileName, line: newStart });
-                            content.push({
-                                type: "diff",
-                                path: newFileName || oldFileName,
-                                oldText: oldText.join("\n") || null,
-                                newText: newText.join("\n"),
-                            });
-                        }
-                    }
-                }
+        case "Bash": {
+            const result = toolResult.content;
+            const terminalId = "tool_use_id" in toolResult ? String(toolResult.tool_use_id) : "";
+            const isError = "is_error" in toolResult && toolResult.is_error;
+            // Extract output and exit code from either format:
+            // 1. BetaBashCodeExecutionResultBlock: { type: "bash_code_execution_result", stdout, stderr, return_code }
+            // 2. Plain string content from a regular tool_result
+            // 3. Array content (e.g. [{ type: "text", text: "..." }])
+            let output = "";
+            let exitCode = isError ? 1 : 0;
+            if (result &&
+                typeof result === "object" &&
+                "type" in result &&
+                result.type === "bash_code_execution_result") {
+                const bashResult = result;
+                output = [bashResult.stdout, bashResult.stderr].filter(Boolean).join("\n");
+                exitCode = bashResult.return_code;
             }
-            const result = {};
-            if (content.length > 0) {
-                result.content = content;
+            else if (typeof result === "string") {
+                output = result;
             }
-            if (locations.length > 0) {
-                result.locations = locations;
+            else if (Array.isArray(result) &&
+                result.length > 0 &&
+                "text" in result[0] &&
+                typeof result[0].text === "string") {
+                output = result.map((c) => c.text).join("\n");
             }
-            return result;
+            if (supportsTerminalOutput) {
+                return {
+                    content: [{ type: "terminal", terminalId }],
+                    _meta: {
+                        terminal_info: {
+                            terminal_id: terminalId,
+                        },
+                        terminal_output: {
+                            terminal_id: terminalId,
+                            data: output,
+                        },
+                        terminal_exit: {
+                            terminal_id: terminalId,
+                            exit_code: exitCode,
+                            signal: null,
+                        },
+                    },
+                };
+            }
+            // Fallback: format output as a code block without terminal _meta
+            if (output.trim()) {
+                return {
+                    content: [
+                        {
+                            type: "content",
+                            content: {
+                                type: "text",
+                                text: `\`\`\`console\n${output.trimEnd()}\n\`\`\``,
+                            },
+                        },
+                    ],
+                };
+            }
+            return {};
         }
-        case acpToolNames.bash:
-        case "edit":
-        case "Edit":
-        case acpToolNames.write:
+        case "Edit": // Edit is handled in hooks
         case "Write": {
             return {};
         }
         case "ExitPlanMode": {
             return { title: "Exited Plan Mode" };
         }
-        case "Task":
-        case "NotebookEdit":
-        case "NotebookRead":
-        case "TodoWrite":
-        case "exit_plan_mode":
-        case "Bash":
-        case "BashOutput":
-        case "KillBash":
-        case "LS":
-        case "Glob":
-        case "Grep":
-        case "WebFetch":
-        case "WebSearch":
-        case "Other":
         default: {
             return toAcpContentUpdate(toolResult.content, "is_error" in toolResult ? toolResult.is_error : false);
         }
@@ -551,6 +492,52 @@ export function markdownEscape(text) {
     }
     return escape + "\n" + text + (text.endsWith("\n") ? "" : "\n") + escape;
 }
+/**
+ * Builds diff ToolUpdate content from the structured Edit toolResponse provided
+ * by the PostToolUse hook. Unlike parsing the plain unified diff string, this uses
+ * the pre-parsed structuredPatch which supports multiple replacement sites (replaceAll)
+ * and always includes context lines for better readability.
+ */
+export function toolUpdateFromEditToolResponse(toolResponse) {
+    if (!toolResponse || typeof toolResponse !== "object")
+        return {};
+    const response = toolResponse;
+    if (!response.filePath || !Array.isArray(response.structuredPatch))
+        return {};
+    const content = [];
+    const locations = [];
+    for (const { lines, newStart } of response.structuredPatch) {
+        const oldText = [];
+        const newText = [];
+        for (const line of lines) {
+            if (line.startsWith("-")) {
+                oldText.push(line.slice(1));
+            }
+            else if (line.startsWith("+")) {
+                newText.push(line.slice(1));
+            }
+            else {
+                oldText.push(line.slice(1));
+                newText.push(line.slice(1));
+            }
+        }
+        if (oldText.length > 0 || newText.length > 0) {
+            locations.push({ path: response.filePath, line: newStart });
+            content.push({
+                type: "diff",
+                path: response.filePath,
+                oldText: oldText.join("\n") || null,
+                newText: newText.join("\n"),
+            });
+        }
+    }
+    const result = {};
+    if (content.length > 0)
+        result.content = content;
+    if (locations.length > 0)
+        result.locations = locations;
+    return result;
+}
 /* A global variable to store callbacks that should be executed when receiving hooks from Claude Code */
 const toolUseCallbacks = {};
 /* Setup callbacks that will be called when receiving hooks from Claude Code */
@@ -579,44 +566,4 @@ export const createPostToolUseHook = (logger = console, options) => async (input
         }
     }
     return { continue: true };
-};
-/**
- * Creates a PreToolUse hook that checks permissions using the SettingsManager.
- * This runs before the SDK's built-in permission rules, allowing us to enforce
- * our own permission settings for ACP-prefixed tools.
- */
-export const createPreToolUseHook = (settingsManager, logger = console) => async (input, _toolUseID) => {
-    if (input.hook_event_name !== "PreToolUse") {
-        return { continue: true };
-    }
-    const toolName = input.tool_name;
-    const toolInput = input.tool_input;
-    const permissionCheck = settingsManager.checkPermission(toolName, toolInput);
-    if (permissionCheck.decision !== "ask") {
-        logger.log(`[PreToolUseHook] Tool: ${toolName}, Decision: ${permissionCheck.decision}, Rule: ${permissionCheck.rule}`);
-    }
-    switch (permissionCheck.decision) {
-        case "allow":
-            return {
-                continue: true,
-                hookSpecificOutput: {
-                    hookEventName: "PreToolUse",
-                    permissionDecision: "allow",
-                    permissionDecisionReason: `Allowed by settings rule: ${permissionCheck.rule}`,
-                },
-            };
-        case "deny":
-            return {
-                continue: true,
-                hookSpecificOutput: {
-                    hookEventName: "PreToolUse",
-                    permissionDecision: "deny",
-                    permissionDecisionReason: `Denied by settings rule: ${permissionCheck.rule}`,
-                },
-            };
-        case "ask":
-        default:
-            // Let the normal permission flow continue
-            return { continue: true };
-    }
 };

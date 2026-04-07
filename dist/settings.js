@@ -1,155 +1,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as os from "node:os";
-import { minimatch } from "minimatch";
-import { ACP_TOOL_NAME_PREFIX, acpToolNames } from "./tools.js";
 import { CLAUDE_CONFIG_DIR } from "./acp-agent.js";
 /**
- * Shell operators that can be used for command chaining/injection
- * These should cause a prefix match to fail to prevent bypasses like:
- * - "safe-cmd && malicious-cmd"
- * - "safe-cmd; malicious-cmd"
- * - "safe-cmd | malicious-cmd"
- * - "safe-cmd || malicious-cmd"
- * - "$(malicious-cmd)"
- * - "`malicious-cmd`"
+ * Reads and parses a JSON settings file, returning an empty object if not found or invalid.
+ * Silently ignores missing files (ENOENT) but logs warnings for other errors
+ * (malformed JSON, permission errors, etc.) to aid debugging.
  */
-const SHELL_OPERATORS = ["&&", "||", ";", "|", "$(", "`", "\n"];
-/**
- * Checks if a string contains shell operators that could allow command chaining
- */
-function containsShellOperator(str) {
-    return SHELL_OPERATORS.some((op) => str.includes(op));
-}
-/*
- * Tools that modify files. Per Claude Code docs:
- * "Edit rules apply to all built-in tools that edit files."
- * This means an Edit(...) rule should match Write, MultiEdit, etc.
- */
-const FILE_EDITING_TOOLS = [acpToolNames.edit, acpToolNames.write];
-/**
- * Tools that read files. Per Claude Code docs:
- * "Claude will make a best-effort attempt to apply Read rules to all built-in tools
- * that read files like Grep and Glob."
- * This means a Read(...) rule should match Grep, Glob, etc.
- */
-const FILE_READING_TOOLS = [acpToolNames.read];
-/**
- * Functions to extract the relevant argument from tool input for permission matching
- */
-const TOOL_ARG_ACCESSORS = {
-    mcp__acp__Read: (input) => input?.file_path,
-    mcp__acp__Edit: (input) => input?.file_path,
-    mcp__acp__Write: (input) => input?.file_path,
-    mcp__acp__Bash: (input) => input?.command,
-};
-/**
- * Parses a permission rule string into its components
- * Examples:
- *   "Read" -> { toolName: "Read" }
- *   "Read(./.env)" -> { toolName: "Read", argument: "./.env" }
- *   "Bash(npm run:*)" -> { toolName: "Bash", argument: "npm run", isWildcard: true }
- */
-function parseRule(rule) {
-    const match = rule.match(/^(\w+)(?:\((.+)\))?$/);
-    if (!match) {
-        return { toolName: rule };
-    }
-    const [, toolName, argument] = match;
-    if (argument && argument.endsWith(":*")) {
-        return {
-            toolName,
-            argument: argument.slice(0, -2),
-            isWildcard: true,
-        };
-    }
-    return { toolName, argument };
-}
-/**
- * Normalizes a path for comparison:
- * - Expands ~ to home directory
- * - Resolves relative paths against cwd
- * - Normalizes path separators
- */
-function normalizePath(filePath, cwd) {
-    if (filePath.startsWith("~/")) {
-        filePath = path.join(os.homedir(), filePath.slice(2));
-    }
-    else if (filePath.startsWith("./")) {
-        filePath = path.join(cwd, filePath.slice(2));
-    }
-    else if (!path.isAbsolute(filePath)) {
-        filePath = path.join(cwd, filePath);
-    }
-    // Convert backslashes to forward slashes for minimatch compatibility on Windows
-    return path.normalize(filePath).replace(/\\/g, "/");
-}
-/**
- * Checks if a file path matches a glob pattern
- */
-function matchesGlob(pattern, filePath, cwd) {
-    const normalizedPattern = normalizePath(pattern, cwd);
-    const normalizedPath = normalizePath(filePath, cwd);
-    return minimatch(normalizedPath, normalizedPattern, {
-        dot: true,
-        matchBase: false,
-        nocase: process.platform === "win32",
-    });
-}
-/**
- * Checks if a tool invocation matches a parsed permission rule
- */
-function matchesRule(rule, toolName, toolInput, cwd) {
-    // Per Claude Code docs:
-    // - "Edit rules apply to all built-in tools that edit files."
-    // - "Claude will make a best-effort attempt to apply Read rules to all built-in tools
-    //    that read files like Grep, Glob, and LS."
-    const ruleAppliesToTool = (rule.toolName === "Bash" && toolName === acpToolNames.bash) ||
-        (rule.toolName === "Edit" && FILE_EDITING_TOOLS.includes(toolName)) ||
-        (rule.toolName === "Read" && FILE_READING_TOOLS.includes(toolName));
-    if (!ruleAppliesToTool) {
-        return false;
-    }
-    if (!rule.argument) {
-        return true;
-    }
-    const argAccessor = TOOL_ARG_ACCESSORS[toolName];
-    if (!argAccessor) {
-        return true;
-    }
-    const actualArg = argAccessor(toolInput);
-    if (!actualArg) {
-        return false;
-    }
-    if (toolName === acpToolNames.bash) {
-        // Per Claude Code docs: https://code.claude.com/docs/en/iam#tool-specific-permission-rules
-        // - Bash(npm run build) matches the EXACT command "npm run build"
-        // - Bash(npm run test:*) matches commands STARTING WITH "npm run test"
-        // The :* suffix enables prefix matching, without it the match is exact
-        //
-        // Also from docs: "Claude Code is aware of shell operators (like &&) so a prefix match
-        // rule like Bash(safe-cmd:*) won't give it permission to run the command safe-cmd && other-cmd"
-        if (rule.isWildcard) {
-            if (!actualArg.startsWith(rule.argument)) {
-                return false;
-            }
-            // Check that the matched prefix isn't followed by shell operators that could
-            // allow command chaining/injection
-            const remainder = actualArg.slice(rule.argument.length);
-            if (containsShellOperator(remainder)) {
-                return false;
-            }
-            return true;
-        }
-        return actualArg === rule.argument;
-    }
-    // For file-based tools (Read, Edit, Write), use glob matching
-    return matchesGlob(rule.argument, actualArg, cwd);
-}
-/**
- * Reads and parses a JSON settings file, returning an empty object if not found or invalid
- */
-async function loadSettingsFile(filePath) {
+async function loadSettingsFile(filePath, logger) {
     if (!filePath) {
         return {};
     }
@@ -157,7 +14,11 @@ async function loadSettingsFile(filePath) {
         const content = await fs.promises.readFile(filePath, "utf-8");
         return JSON.parse(content);
     }
-    catch {
+    catch (error) {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+            return {};
+        }
+        logger?.error(`Failed to load settings from ${filePath}:`, error);
         return {};
     }
 }
@@ -196,7 +57,9 @@ export class SettingsManager {
         this.mergedSettings = {};
         this.watchers = [];
         this.initialized = false;
+        this.disposed = false;
         this.debounceTimer = null;
+        this.initPromise = null;
         this.cwd = cwd;
         this.onChange = options?.onChange;
         this.logger = options?.logger ?? console;
@@ -208,9 +71,18 @@ export class SettingsManager {
         if (this.initialized) {
             return;
         }
-        await this.loadAllSettings();
-        this.setupWatchers();
-        this.initialized = true;
+        if (this.initPromise) {
+            return this.initPromise;
+        }
+        this.disposed = false;
+        this.initPromise = this.loadAllSettings().then(() => {
+            if (!this.disposed) {
+                this.setupWatchers();
+                this.initialized = true;
+            }
+            this.initPromise = null;
+        });
+        return this.initPromise;
     }
     /**
      * Returns the path to the user settings file
@@ -235,10 +107,10 @@ export class SettingsManager {
      */
     async loadAllSettings() {
         const [userSettings, projectSettings, localSettings, enterpriseSettings] = await Promise.all([
-            loadSettingsFile(this.getUserSettingsPath()),
-            loadSettingsFile(this.getProjectSettingsPath()),
-            loadSettingsFile(this.getLocalSettingsPath()),
-            loadSettingsFile(getManagedSettingsPath()),
+            loadSettingsFile(this.getUserSettingsPath(), this.logger),
+            loadSettingsFile(this.getProjectSettingsPath(), this.logger),
+            loadSettingsFile(this.getLocalSettingsPath(), this.logger),
+            loadSettingsFile(getManagedSettingsPath(), this.logger),
         ]);
         this.userSettings = userSettings;
         this.projectSettings = projectSettings;
@@ -258,39 +130,19 @@ export class SettingsManager {
             this.localSettings,
             this.enterpriseSettings,
         ];
-        const merged = {
-            permissions: {
-                allow: [],
-                deny: [],
-                ask: [],
-            },
-        };
+        const merged = {};
         for (const settings of allSettings) {
-            if (settings.permissions) {
-                if (settings.permissions.allow) {
-                    merged.permissions.allow.push(...settings.permissions.allow);
-                }
-                if (settings.permissions.deny) {
-                    merged.permissions.deny.push(...settings.permissions.deny);
-                }
-                if (settings.permissions.ask) {
-                    merged.permissions.ask.push(...settings.permissions.ask);
-                }
-                if (settings.permissions.additionalDirectories) {
-                    merged.permissions.additionalDirectories = [
-                        ...(merged.permissions.additionalDirectories || []),
-                        ...settings.permissions.additionalDirectories,
-                    ];
-                }
-                if (settings.permissions.defaultMode) {
-                    merged.permissions.defaultMode = settings.permissions.defaultMode;
-                }
-            }
             if (settings.env) {
                 merged.env = { ...merged.env, ...settings.env };
             }
             if (settings.model) {
                 merged.model = settings.model;
+            }
+            if (settings.permissions?.defaultMode !== undefined) {
+                merged.permissions = {
+                    ...merged.permissions,
+                    defaultMode: settings.permissions.defaultMode,
+                };
             }
         }
         this.mergedSettings = merged;
@@ -337,53 +189,19 @@ export class SettingsManager {
         }
         this.debounceTimer = setTimeout(async () => {
             this.debounceTimer = null;
+            if (this.disposed) {
+                return;
+            }
             try {
                 await this.loadAllSettings();
-                this.onChange?.();
+                if (!this.disposed) {
+                    this.onChange?.();
+                }
             }
             catch (error) {
                 this.logger.error("Failed to reload settings:", error);
             }
         }, 100);
-    }
-    /**
-     * Checks if a tool invocation is allowed based on the loaded settings.
-     *
-     * @param toolName - The tool name (can be ACP-prefixed like mcp__acp__Read or plain like Read)
-     * @param toolInput - The tool input object
-     * @returns The permission decision and matching rule info
-     */
-    checkPermission(toolName, toolInput) {
-        if (!toolName.startsWith(ACP_TOOL_NAME_PREFIX)) {
-            return { decision: "ask" };
-        }
-        const permissions = this.mergedSettings.permissions;
-        if (!permissions) {
-            return { decision: "ask" };
-        }
-        // Check deny rules first (highest priority)
-        for (const rule of permissions.deny || []) {
-            const parsed = parseRule(rule);
-            if (matchesRule(parsed, toolName, toolInput, this.cwd)) {
-                return { decision: "deny", rule, source: "deny" };
-            }
-        }
-        // Check allow rules
-        for (const rule of permissions.allow || []) {
-            const parsed = parseRule(rule);
-            if (matchesRule(parsed, toolName, toolInput, this.cwd)) {
-                return { decision: "allow", rule, source: "allow" };
-            }
-        }
-        // Check ask rules
-        for (const rule of permissions.ask || []) {
-            const parsed = parseRule(rule);
-            if (matchesRule(parsed, toolName, toolInput, this.cwd)) {
-                return { decision: "ask", rule, source: "ask" };
-            }
-        }
-        // No matching rule - default to ask
-        return { decision: "ask" };
     }
     /**
      * Returns the current merged settings
@@ -406,13 +224,15 @@ export class SettingsManager {
         }
         this.dispose();
         this.cwd = cwd;
-        this.initialized = false;
         await this.initialize();
     }
     /**
      * Disposes of file watchers and cleans up resources
      */
     dispose() {
+        this.disposed = true;
+        this.initialized = false;
+        this.initPromise = null;
         if (this.debounceTimer) {
             clearTimeout(this.debounceTimer);
             this.debounceTimer = null;
@@ -421,6 +241,5 @@ export class SettingsManager {
             watcher.close();
         }
         this.watchers = [];
-        this.initialized = false;
     }
 }

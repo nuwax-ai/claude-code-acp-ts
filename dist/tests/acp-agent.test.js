@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { spawn, spawnSync } from "child_process";
 import { ClientSideConnection, ndJsonStream, } from "@agentclientprotocol/sdk";
 import { nodeToWebWritable, nodeToWebReadable } from "../utils.js";
-import { markdownEscape, toolInfoFromToolUse, toolUpdateFromToolResult } from "../tools.js";
-import { toAcpNotifications, promptToClaude } from "../acp-agent.js";
+import { markdownEscape, toolInfoFromToolUse, toDisplayPath, toolUpdateFromToolResult, toolUpdateFromEditToolResponse, } from "../tools.js";
+import { toAcpNotifications, promptToClaude, ClaudeAcpAgent, claudeCliPath } from "../acp-agent.js";
+import { Pushable } from "../utils.js";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration", () => {
@@ -160,7 +161,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
             prompt: [{ type: "text", text: "/compact" }],
             sessionId: newSessionResponse.sessionId,
         });
-        expect(client.takeReceivedText()).toBe("");
+        expect(client.takeReceivedText()).toBe("Compacting...\n\nCompacting completed.");
         // Send something
         await connection.prompt({
             prompt: [{ type: "text", text: "Hi" }],
@@ -178,7 +179,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
             ],
             sessionId: newSessionResponse.sessionId,
         });
-        expect(client.takeReceivedText()).toContain("");
+        expect(client.takeReceivedText()).toContain("Compacting...\n\nCompacting completed.");
     }, 30000);
 });
 describe("tool conversions", () => {
@@ -194,7 +195,7 @@ describe("tool conversions", () => {
         };
         expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
             kind: "execute",
-            title: "`rm README.md.rm`",
+            title: "rm README.md.rm",
             content: [
                 {
                     content: {
@@ -247,22 +248,6 @@ describe("tool conversions", () => {
             ],
         });
     });
-    it("should handle LS tool calls", () => {
-        const tool_use = {
-            type: "tool_use",
-            id: "toolu_01EEqsX7Eb9hpx87KAHVPTey",
-            name: "LS",
-            input: {
-                path: "/Users/test/github/claude-code-acp",
-            },
-        };
-        expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
-            kind: "search",
-            title: "List the `/Users/test/github/claude-code-acp` directory's contents",
-            content: [],
-            locations: [],
-        });
-    });
     it("should handle Grep tool calls", () => {
         const tool_use = {
             type: "tool_use",
@@ -302,11 +287,11 @@ describe("tool conversions", () => {
             locations: [{ path: "/Users/test/project/example.txt" }],
         });
     });
-    it("should handle mcp__acp__Write tool calls", () => {
+    it("should handle Write tool calls", () => {
         const tool_use = {
             type: "tool_use",
             id: "toolu_01GHI789JKL456",
-            name: "mcp__acp__Write",
+            name: "Write",
             input: {
                 file_path: "/Users/test/project/config.json",
                 content: '{"version": "1.0.0"}',
@@ -326,6 +311,71 @@ describe("tool conversions", () => {
             locations: [{ path: "/Users/test/project/config.json" }],
         });
     });
+    it("should handle Edit tool calls", () => {
+        const tool_use = {
+            type: "tool_use",
+            id: "toolu_01EDIT123",
+            name: "Edit",
+            input: {
+                file_path: "/Users/test/project/test.txt",
+                old_string: "old text",
+                new_string: "new text",
+            },
+        };
+        expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
+            kind: "edit",
+            title: "Edit /Users/test/project/test.txt",
+            content: [
+                {
+                    type: "diff",
+                    path: "/Users/test/project/test.txt",
+                    oldText: "old text",
+                    newText: "new text",
+                },
+            ],
+            locations: [{ path: "/Users/test/project/test.txt" }],
+        });
+    });
+    it("should handle Edit tool calls with replace_all", () => {
+        const tool_use = {
+            type: "tool_use",
+            id: "toolu_01EDIT456",
+            name: "Edit",
+            input: {
+                replace_all: false,
+                file_path: "/Users/benbrandt/github/codex-acp/src/thread.rs",
+                old_string: "struct PromptState {\n    active_command: Option<ActiveCommand>,\n    active_web_search: Option<String>,\n}",
+                new_string: "struct PromptState {\n    active_commands: HashMap<String, ActiveCommand>,\n    active_web_search: Option<String>,\n}",
+            },
+        };
+        expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
+            kind: "edit",
+            title: "Edit /Users/benbrandt/github/codex-acp/src/thread.rs",
+            content: [
+                {
+                    type: "diff",
+                    path: "/Users/benbrandt/github/codex-acp/src/thread.rs",
+                    oldText: "struct PromptState {\n    active_command: Option<ActiveCommand>,\n    active_web_search: Option<String>,\n}",
+                    newText: "struct PromptState {\n    active_commands: HashMap<String, ActiveCommand>,\n    active_web_search: Option<String>,\n}",
+                },
+            ],
+            locations: [{ path: "/Users/benbrandt/github/codex-acp/src/thread.rs" }],
+        });
+    });
+    it("should handle Edit tool calls without file_path", () => {
+        const tool_use = {
+            type: "tool_use",
+            id: "toolu_01EDIT789",
+            name: "Edit",
+            input: {},
+        };
+        expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
+            kind: "edit",
+            title: "Edit",
+            content: [],
+            locations: [],
+        });
+    });
     it("should handle Read tool calls", () => {
         const tool_use = {
             type: "tool_use",
@@ -337,16 +387,16 @@ describe("tool conversions", () => {
         };
         expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
             kind: "read",
-            title: "Read File",
+            title: "Read /Users/test/project/readme.md",
             content: [],
-            locations: [{ path: "/Users/test/project/readme.md", line: 0 }],
+            locations: [{ path: "/Users/test/project/readme.md", line: 1 }],
         });
     });
-    it("should handle mcp__acp__Read tool calls", () => {
+    it("should handle Read tool calls", () => {
         const tool_use = {
             type: "tool_use",
             id: "toolu_01YZA789BCD123",
-            name: "mcp__acp__Read",
+            name: "Read",
             input: {
                 file_path: "/Users/test/project/data.json",
             },
@@ -355,14 +405,14 @@ describe("tool conversions", () => {
             kind: "read",
             title: "Read /Users/test/project/data.json",
             content: [],
-            locations: [{ path: "/Users/test/project/data.json", line: 0 }],
+            locations: [{ path: "/Users/test/project/data.json", line: 1 }],
         });
     });
-    it("should handle mcp__acp__Read with limit", () => {
+    it("should handle Read with limit", () => {
         const tool_use = {
             type: "tool_use",
             id: "toolu_01EFG456HIJ789",
-            name: "mcp__acp__Read",
+            name: "Read",
             input: {
                 file_path: "/Users/test/project/large.txt",
                 limit: 100,
@@ -372,14 +422,14 @@ describe("tool conversions", () => {
             kind: "read",
             title: "Read /Users/test/project/large.txt (1 - 100)",
             content: [],
-            locations: [{ path: "/Users/test/project/large.txt", line: 0 }],
+            locations: [{ path: "/Users/test/project/large.txt", line: 1 }],
         });
     });
-    it("should handle mcp__acp__Read with offset and limit", () => {
+    it("should handle Read with offset and limit", () => {
         const tool_use = {
             type: "tool_use",
             id: "toolu_01KLM789NOP456",
-            name: "mcp__acp__Read",
+            name: "Read",
             input: {
                 file_path: "/Users/test/project/large.txt",
                 offset: 50,
@@ -388,16 +438,16 @@ describe("tool conversions", () => {
         };
         expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
             kind: "read",
-            title: "Read /Users/test/project/large.txt (51 - 150)",
+            title: "Read /Users/test/project/large.txt (50 - 149)",
             content: [],
             locations: [{ path: "/Users/test/project/large.txt", line: 50 }],
         });
     });
-    it("should handle mcp__acp__Read with only offset", () => {
+    it("should handle Read with only offset", () => {
         const tool_use = {
             type: "tool_use",
             id: "toolu_01QRS123TUV789",
-            name: "mcp__acp__Read",
+            name: "Read",
             input: {
                 file_path: "/Users/test/project/large.txt",
                 offset: 200,
@@ -405,40 +455,22 @@ describe("tool conversions", () => {
         };
         expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
             kind: "read",
-            title: "Read /Users/test/project/large.txt (from line 201)",
+            title: "Read /Users/test/project/large.txt (from line 200)",
             content: [],
             locations: [{ path: "/Users/test/project/large.txt", line: 200 }],
         });
     });
-    it("should handle KillBash entries", () => {
+    it("should use relative path in title when cwd is provided", () => {
         const tool_use = {
             type: "tool_use",
-            id: "toolu_01PhLms5fuvmdjy2bb6dfUKT",
-            name: "KillShell",
-            input: {
-                shell_id: "bash_1",
-            },
+            id: "toolu_01READ_CWD",
+            name: "Read",
+            input: { file_path: "/Users/test/project/src/main.ts" },
         };
-        expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
-            kind: "execute",
-            title: `Kill Process`,
-            content: [],
-        });
-    });
-    it("should handle BashOutput entries", () => {
-        const tool_use = {
-            type: "tool_use",
-            id: "toolu_01SJUWPtj1QspgANgtpqGPuN",
-            name: "BashOutput",
-            input: {
-                bash_id: "bash_1",
-            },
-        };
-        expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
-            kind: "execute",
-            title: `Tail Logs`,
-            content: [],
-        });
+        const result = toolInfoFromToolUse(tool_use, false, "/Users/test/project");
+        expect(result.title).toBe("Read src/main.ts");
+        // locations.path stays absolute for navigation
+        expect(result.locations).toStrictEqual([{ path: "/Users/test/project/src/main.ts", line: 1 }]);
     });
     it("should handle plan entries", () => {
         const received = {
@@ -515,6 +547,7 @@ describe("tool conversions", () => {
                     server_tool_use: null,
                     inference_geo: null,
                     iterations: null,
+                    speed: null,
                 },
                 context_management: null,
             },
@@ -577,7 +610,7 @@ describe("tool conversions", () => {
         const toolUse = {
             type: "tool_use",
             id: "toolu_01MNO345",
-            name: "mcp__acp__Edit",
+            name: "Edit",
             input: {
                 file_path: "/Users/test/project/test.txt",
                 old_string: "old",
@@ -603,7 +636,7 @@ describe("tool conversions", () => {
         const toolUse = {
             type: "tool_use",
             id: "toolu_01MNO345",
-            name: "mcp__acp__Edit",
+            name: "Edit",
             input: {
                 file_path: "/Users/test/project/test.txt",
                 old_string: "old",
@@ -803,6 +836,125 @@ describe("tool conversions", () => {
         });
     });
 });
+describe("toDisplayPath", () => {
+    it("should relativize paths inside cwd and keep absolute paths outside", () => {
+        expect(toDisplayPath("/Users/test/project/src/main.ts", "/Users/test/project")).toBe("src/main.ts");
+        expect(toDisplayPath("/etc/hosts", "/Users/test/project")).toBe("/etc/hosts");
+        expect(toDisplayPath("/Users/test/project/src/main.ts")).toBe("/Users/test/project/src/main.ts");
+        // Partial directory name match should not be treated as inside cwd
+        expect(toDisplayPath("/Users/test/project-other/file.ts", "/Users/test/project")).toBe("/Users/test/project-other/file.ts");
+    });
+});
+describe("toolUpdateFromEditToolResponse", () => {
+    it("should return empty for non-object input", () => {
+        expect(toolUpdateFromEditToolResponse(null)).toEqual({});
+        expect(toolUpdateFromEditToolResponse(undefined)).toEqual({});
+        expect(toolUpdateFromEditToolResponse("string")).toEqual({});
+    });
+    it("should return empty when filePath or structuredPatch is missing", () => {
+        expect(toolUpdateFromEditToolResponse({})).toEqual({});
+        expect(toolUpdateFromEditToolResponse({ filePath: "/foo.ts" })).toEqual({});
+        expect(toolUpdateFromEditToolResponse({ structuredPatch: [] })).toEqual({});
+    });
+    it("should build diff content from a single-hunk structuredPatch", () => {
+        const toolResponse = {
+            filePath: "/Users/test/project/test.txt",
+            structuredPatch: [
+                {
+                    oldStart: 1,
+                    oldLines: 3,
+                    newStart: 1,
+                    newLines: 3,
+                    lines: [" context before", "-old line", "+new line", " context after"],
+                },
+            ],
+        };
+        expect(toolUpdateFromEditToolResponse(toolResponse)).toEqual({
+            content: [
+                {
+                    type: "diff",
+                    path: "/Users/test/project/test.txt",
+                    oldText: "context before\nold line\ncontext after",
+                    newText: "context before\nnew line\ncontext after",
+                },
+            ],
+            locations: [{ path: "/Users/test/project/test.txt", line: 1 }],
+        });
+    });
+    it("should build multiple diff content blocks for replaceAll with multiple hunks", () => {
+        const toolResponse = {
+            filePath: "/Users/test/project/file.ts",
+            structuredPatch: [
+                {
+                    oldStart: 5,
+                    oldLines: 1,
+                    newStart: 5,
+                    newLines: 1,
+                    lines: ["-oldValue", "+newValue"],
+                },
+                {
+                    oldStart: 20,
+                    oldLines: 1,
+                    newStart: 20,
+                    newLines: 1,
+                    lines: ["-oldValue", "+newValue"],
+                },
+            ],
+        };
+        expect(toolUpdateFromEditToolResponse(toolResponse)).toEqual({
+            content: [
+                {
+                    type: "diff",
+                    path: "/Users/test/project/file.ts",
+                    oldText: "oldValue",
+                    newText: "newValue",
+                },
+                {
+                    type: "diff",
+                    path: "/Users/test/project/file.ts",
+                    oldText: "oldValue",
+                    newText: "newValue",
+                },
+            ],
+            locations: [
+                { path: "/Users/test/project/file.ts", line: 5 },
+                { path: "/Users/test/project/file.ts", line: 20 },
+            ],
+        });
+    });
+    it("should handle deletion (newText becomes empty string)", () => {
+        const toolResponse = {
+            filePath: "/Users/test/project/file.ts",
+            structuredPatch: [
+                {
+                    oldStart: 10,
+                    oldLines: 2,
+                    newStart: 10,
+                    newLines: 1,
+                    lines: [" context", "-removed line"],
+                },
+            ],
+        };
+        expect(toolUpdateFromEditToolResponse(toolResponse)).toEqual({
+            content: [
+                {
+                    type: "diff",
+                    path: "/Users/test/project/file.ts",
+                    oldText: "context\nremoved line",
+                    newText: "context",
+                },
+            ],
+            locations: [{ path: "/Users/test/project/file.ts", line: 10 }],
+        });
+    });
+    it("should return empty for empty structuredPatch array", () => {
+        const toolResponse = {
+            filePath: "/Users/test/project/file.ts",
+            structuredPatch: [],
+        };
+        expect(toolUpdateFromEditToolResponse(toolResponse)).toEqual({});
+    });
+});
 describe("escape markdown", () => {
     it("should escape markdown characters", () => {
         let text = "Hello *world*!";
@@ -850,6 +1002,10 @@ describe("prompt conversion", () => {
     });
 });
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
+    it("finds vendored cli path", async () => {
+        const path = await claudeCliPath();
+        expect(path).toContain("@anthropic-ai/claude-agent-sdk/cli.js");
+    });
     it("query has a 'default' model", async () => {
         const q = query({ prompt: "hi" });
         const models = await q.supportedModels();
@@ -891,13 +1047,13 @@ describe("permission requests", () => {
                     name: "Bash",
                     input: { command: "ls -la", description: "List files" },
                 },
-                expectedTitlePart: "`ls -la`",
+                expectedTitlePart: "ls -la",
             },
             {
                 toolUse: {
                     type: "tool_use",
                     id: "test-3",
-                    name: "mcp__acp__Read",
+                    name: "Read",
                     input: { file_path: "/test/data.json" },
                 },
                 expectedTitlePart: "/test/data.json",
@@ -910,16 +1066,704 @@ describe("permission requests", () => {
             expect(toolInfo.title).toBeDefined();
             expect(toolInfo.title).toContain(testCase.expectedTitlePart);
             // Verify the structure that our fix creates for requestPermission
+            // We now spread the full toolInfo (title, kind, content, locations)
             const requestStructure = {
                 toolCall: {
                     toolCallId: testCase.toolUse.id,
                     rawInput: testCase.toolUse.input,
-                    title: toolInfo.title, // This is what commit 1785d86 adds
+                    ...toolInfo,
                 },
             };
             // Ensure the title field is present and populated
             expect(requestStructure.toolCall.title).toBeDefined();
             expect(requestStructure.toolCall.title).toContain(testCase.expectedTitlePart);
+            // Ensure kind is included so the client can render appropriate UI
+            expect(requestStructure.toolCall.kind).toBeDefined();
+            expect(typeof requestStructure.toolCall.kind).toBe("string");
+            // Ensure content is included so the client always has tool call details
+            expect(requestStructure.toolCall.content).toBeDefined();
+            expect(Array.isArray(requestStructure.toolCall.content)).toBe(true);
         }
+    });
+});
+describe("stop reason propagation", () => {
+    function createMockAgent() {
+        const mockClient = {
+            sessionUpdate: async () => { },
+        };
+        return new ClaudeAcpAgent(mockClient, { log: () => { }, error: () => { } });
+    }
+    function createResultMessage(overrides) {
+        return {
+            type: "result",
+            subtype: overrides.subtype,
+            stop_reason: overrides.stop_reason,
+            is_error: overrides.is_error,
+            result: overrides.result ?? "",
+            errors: overrides.errors ?? [],
+            duration_ms: 0,
+            duration_api_ms: 0,
+            num_turns: 1,
+            total_cost_usd: 0,
+            usage: {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+            modelUsage: {},
+            permission_denials: [],
+            uuid: randomUUID(),
+            session_id: "test-session",
+        };
+    }
+    function injectSession(agent, messages) {
+        const input = new Pushable();
+        async function* messageGenerator() {
+            // Wait for the prompt to push its user message so we can replay it
+            const iter = input[Symbol.asyncIterator]();
+            const { value: userMessage, done } = await iter.next();
+            if (!done && userMessage) {
+                yield {
+                    type: "user",
+                    message: userMessage.message,
+                    parent_tool_use_id: null,
+                    uuid: userMessage.uuid,
+                    session_id: "test-session",
+                    isReplay: true,
+                };
+            }
+            yield* messages;
+        }
+        agent.sessions["test-session"] = {
+            query: messageGenerator(),
+            input,
+            cancelled: false,
+            cwd: "/test",
+            modes: {
+                currentModeId: "default",
+                availableModes: [],
+            },
+            models: {
+                currentModelId: "default",
+                availableModels: [],
+            },
+            settingsManager: { dispose: vi.fn() },
+            accumulatedUsage: {
+                inputTokens: 0,
+                outputTokens: 0,
+                cachedReadTokens: 0,
+                cachedWriteTokens: 0,
+            },
+            configOptions: [],
+            promptRunning: false,
+            pendingMessages: new Map(),
+            nextPendingOrder: 0,
+            abortController: new AbortController(),
+        };
+    }
+    it("should return max_tokens when success result has stop_reason max_tokens", async () => {
+        const agent = createMockAgent();
+        injectSession(agent, [
+            createResultMessage({ subtype: "success", stop_reason: "max_tokens", is_error: false }),
+            { type: "system", subtype: "session_state_changed", state: "idle" },
+        ]);
+        const response = await agent.prompt({
+            sessionId: "test-session",
+            prompt: [{ type: "text", text: "test" }],
+        });
+        expect(response.stopReason).toBe("max_tokens");
+    });
+    it("should return max_tokens when success result has stop_reason max_tokens and is_error true", async () => {
+        const agent = createMockAgent();
+        injectSession(agent, [
+            createResultMessage({
+                subtype: "success",
+                stop_reason: "max_tokens",
+                is_error: true,
+                result: "Token limit reached",
+            }),
+            { type: "system", subtype: "session_state_changed", state: "idle" },
+        ]);
+        const response = await agent.prompt({
+            sessionId: "test-session",
+            prompt: [{ type: "text", text: "test" }],
+        });
+        expect(response.stopReason).toBe("max_tokens");
+    });
+    it("should return max_tokens when error_during_execution has stop_reason max_tokens", async () => {
+        const agent = createMockAgent();
+        injectSession(agent, [
+            createResultMessage({
+                subtype: "error_during_execution",
+                stop_reason: "max_tokens",
+                is_error: true,
+                errors: ["some error"],
+            }),
+            { type: "system", subtype: "session_state_changed", state: "idle" },
+        ]);
+        const response = await agent.prompt({
+            sessionId: "test-session",
+            prompt: [{ type: "text", text: "test" }],
+        });
+        expect(response.stopReason).toBe("max_tokens");
+    });
+    it("should return end_turn for success with null stop_reason", async () => {
+        const agent = createMockAgent();
+        injectSession(agent, [
+            createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+            { type: "system", subtype: "session_state_changed", state: "idle" },
+        ]);
+        const response = await agent.prompt({
+            sessionId: "test-session",
+            prompt: [{ type: "text", text: "test" }],
+        });
+        expect(response.stopReason).toBe("end_turn");
+    });
+    it("should consume background task results and return the prompt's own result", async () => {
+        const agent = createMockAgent();
+        const input = new Pushable();
+        const backgroundTaskResult = createResultMessage({
+            subtype: "success",
+            stop_reason: null,
+            is_error: false,
+        });
+        // Background task used some tokens
+        backgroundTaskResult.usage.input_tokens = 100;
+        backgroundTaskResult.usage.output_tokens = 50;
+        const promptResult = createResultMessage({
+            subtype: "success",
+            stop_reason: null,
+            is_error: false,
+        });
+        async function* messageGenerator() {
+            // Background task init + result arrive before our prompt's replay
+            yield { type: "system", subtype: "init", session_id: "test-session" };
+            yield backgroundTaskResult;
+            // Now the prompt's user message replay arrives
+            const iter = input[Symbol.asyncIterator]();
+            const { value: userMessage } = await iter.next();
+            yield {
+                type: "user",
+                message: userMessage.message,
+                parent_tool_use_id: null,
+                uuid: userMessage.uuid,
+                session_id: "test-session",
+                isReplay: true,
+            };
+            // Then the prompt's own result
+            yield promptResult;
+            yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        }
+        agent.sessions["test-session"] = {
+            query: messageGenerator(),
+            input,
+            cwd: "/tmp/test",
+            cancelled: false,
+            modes: {
+                currentModeId: "default",
+                availableModes: [],
+            },
+            models: {
+                currentModelId: "default",
+                availableModels: [],
+            },
+            settingsManager: { dispose: vi.fn() },
+            accumulatedUsage: {
+                inputTokens: 0,
+                outputTokens: 0,
+                cachedReadTokens: 0,
+                cachedWriteTokens: 0,
+            },
+            abortController: new AbortController(),
+            configOptions: [],
+            promptRunning: false,
+            pendingMessages: new Map(),
+            nextPendingOrder: 0,
+        };
+        const response = await agent.prompt({
+            sessionId: "test-session",
+            prompt: [{ type: "text", text: "test" }],
+        });
+        expect(response.stopReason).toBe("end_turn");
+        // Usage should include both background task and prompt result tokens
+        expect(response.usage?.inputTokens).toBe(backgroundTaskResult.usage.input_tokens + promptResult.usage.input_tokens);
+        expect(response.usage?.outputTokens).toBe(backgroundTaskResult.usage.output_tokens + promptResult.usage.output_tokens);
+    });
+    it("should throw internal error for success with is_error true and no max_tokens", async () => {
+        const agent = createMockAgent();
+        injectSession(agent, [
+            createResultMessage({
+                subtype: "success",
+                stop_reason: "end_turn",
+                is_error: true,
+                result: "Something went wrong",
+            }),
+        ]);
+        await expect(agent.prompt({
+            sessionId: "test-session",
+            prompt: [{ type: "text", text: "test" }],
+        })).rejects.toThrow("Internal error");
+    });
+});
+describe("session/close", () => {
+    function createMockAgent() {
+        const mockClient = {
+            sessionUpdate: async () => { },
+        };
+        return new ClaudeAcpAgent(mockClient, { log: () => { }, error: () => { } });
+    }
+    function injectSession(agent, sessionId) {
+        function* empty() { }
+        const gen = Object.assign(empty(), { interrupt: vi.fn() });
+        agent.sessions[sessionId] = {
+            query: gen,
+            input: new Pushable(),
+            cancelled: false,
+            cwd: "/test",
+            modes: {
+                currentModeId: "default",
+                availableModes: [],
+            },
+            models: {
+                currentModelId: "default",
+                availableModels: [],
+            },
+            settingsManager: { dispose: vi.fn() },
+            accumulatedUsage: {
+                inputTokens: 0,
+                outputTokens: 0,
+                cachedReadTokens: 0,
+                cachedWriteTokens: 0,
+            },
+            configOptions: [],
+            promptRunning: false,
+            pendingMessages: new Map(),
+            nextPendingOrder: 0,
+            abortController: new AbortController(),
+        };
+        return agent.sessions[sessionId];
+    }
+    it("should close an existing session and remove it", async () => {
+        const agent = createMockAgent();
+        const session = injectSession(agent, "session-1");
+        expect(agent.sessions["session-1"]).toBeDefined();
+        const result = await agent.unstable_closeSession({ sessionId: "session-1" });
+        expect(result).toEqual({});
+        expect(agent.sessions["session-1"]).toBeUndefined();
+        expect(session.query.interrupt).toHaveBeenCalled();
+        expect(session.settingsManager.dispose).toHaveBeenCalled();
+    });
+    it("should abort the session's abort controller", async () => {
+        const agent = createMockAgent();
+        const session = injectSession(agent, "session-2");
+        expect(session.abortController.signal.aborted).toBe(false);
+        await agent.unstable_closeSession({ sessionId: "session-2" });
+        expect(session.abortController.signal.aborted).toBe(true);
+    });
+    it("should throw when closing a non-existent session", async () => {
+        const agent = createMockAgent();
+        await expect(agent.unstable_closeSession({ sessionId: "non-existent" })).rejects.toThrow("Session not found");
+    });
+    it("should not affect other sessions when closing one", async () => {
+        const agent = createMockAgent();
+        injectSession(agent, "session-a");
+        injectSession(agent, "session-b");
+        await agent.unstable_closeSession({ sessionId: "session-a" });
+        expect(agent.sessions["session-a"]).toBeUndefined();
+        expect(agent.sessions["session-b"]).toBeDefined();
+    });
+});
+describe("usage_update computation", () => {
+    function createAssistantMessage(overrides) {
+        return {
+            type: "assistant",
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+            message: {
+                model: overrides.model,
+                content: [{ type: "text", text: "hello" }],
+                usage: overrides.usage ?? {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_read_input_tokens: 20,
+                    cache_creation_input_tokens: 10,
+                },
+            },
+        };
+    }
+    function createResultMessageWithModel(overrides) {
+        return {
+            type: "result",
+            subtype: "success",
+            stop_reason: "end_turn",
+            is_error: false,
+            result: "",
+            errors: [],
+            duration_ms: 0,
+            duration_api_ms: 0,
+            num_turns: 1,
+            total_cost_usd: 0.01,
+            usage: {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+            modelUsage: overrides.modelUsage,
+            permission_denials: [],
+            uuid: randomUUID(),
+            session_id: "test-session",
+        };
+    }
+    function createMockAgentWithCapture() {
+        const updates = [];
+        const mockClient = {
+            sessionUpdate: async (notification) => {
+                updates.push(notification);
+            },
+        };
+        const agent = new ClaudeAcpAgent(mockClient, { log: () => { }, error: () => { } });
+        return { agent, updates };
+    }
+    function injectSession(agent, messages) {
+        const input = new Pushable();
+        async function* messageGenerator() {
+            // Wait for the prompt to push its user message so we can replay it
+            const iter = input[Symbol.asyncIterator]();
+            const { value: userMessage, done } = await iter.next();
+            if (!done && userMessage) {
+                yield {
+                    type: "user",
+                    message: userMessage.message,
+                    parent_tool_use_id: null,
+                    uuid: userMessage.uuid,
+                    session_id: "test-session",
+                    isReplay: true,
+                };
+            }
+            yield* messages;
+        }
+        agent.sessions["test-session"] = {
+            query: messageGenerator(),
+            input,
+            cancelled: false,
+            cwd: "/test",
+            modes: {
+                currentModeId: "default",
+                availableModes: [],
+            },
+            models: {
+                currentModelId: "default",
+                availableModels: [],
+            },
+            settingsManager: {},
+            accumulatedUsage: {
+                inputTokens: 0,
+                outputTokens: 0,
+                cachedReadTokens: 0,
+                cachedWriteTokens: 0,
+            },
+            configOptions: [],
+            promptRunning: false,
+            pendingMessages: new Map(),
+            nextPendingOrder: 0,
+            abortController: new AbortController(),
+        };
+    }
+    it("used sums all token types as post-turn context occupancy proxy", async () => {
+        const { agent, updates } = createMockAgentWithCapture();
+        injectSession(agent, [
+            createAssistantMessage({
+                model: "claude-opus-4-20250514",
+                usage: {
+                    input_tokens: 1000,
+                    output_tokens: 500,
+                    cache_read_input_tokens: 200,
+                    cache_creation_input_tokens: 100,
+                },
+            }),
+            createResultMessageWithModel({
+                modelUsage: {
+                    "claude-opus-4-20250514": {
+                        inputTokens: 1000,
+                        outputTokens: 500,
+                        cacheReadInputTokens: 200,
+                        cacheCreationInputTokens: 100,
+                        webSearchRequests: 0,
+                        costUSD: 0.01,
+                        contextWindow: 1000000,
+                        maxOutputTokens: 16384,
+                    },
+                },
+            }),
+            { type: "system", subtype: "session_state_changed", state: "idle" },
+        ]);
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+        const usageUpdate = updates.find((u) => u.update?.sessionUpdate === "usage_update");
+        expect(usageUpdate).toBeDefined();
+        // used = input(1000) + output(500) + cache_read(200) + cache_creation(100) = 1800
+        expect(usageUpdate.update.used).toBe(1800);
+    });
+    it("size reflects the current model's context window, not min across all", async () => {
+        const { agent, updates } = createMockAgentWithCapture();
+        injectSession(agent, [
+            createAssistantMessage({ model: "claude-opus-4-20250514" }),
+            createResultMessageWithModel({
+                modelUsage: {
+                    "claude-opus-4-20250514": {
+                        inputTokens: 100,
+                        outputTokens: 50,
+                        cacheReadInputTokens: 20,
+                        cacheCreationInputTokens: 10,
+                        webSearchRequests: 0,
+                        costUSD: 0.01,
+                        contextWindow: 1000000,
+                        maxOutputTokens: 16384,
+                    },
+                    "claude-sonnet-4-20250514": {
+                        inputTokens: 50,
+                        outputTokens: 25,
+                        cacheReadInputTokens: 10,
+                        cacheCreationInputTokens: 5,
+                        webSearchRequests: 0,
+                        costUSD: 0.005,
+                        contextWindow: 200000,
+                        maxOutputTokens: 16384,
+                    },
+                },
+            }),
+            { type: "system", subtype: "session_state_changed", state: "idle" },
+        ]);
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+        const usageUpdate = updates.find((u) => u.update?.sessionUpdate === "usage_update");
+        expect(usageUpdate).toBeDefined();
+        // size should be 1000000 (Opus), not 200000 (min of both)
+        expect(usageUpdate.update.size).toBe(1000000);
+    });
+    it("after model switch, size updates to the new model's window", async () => {
+        const { agent, updates } = createMockAgentWithCapture();
+        // Simulate: assistant on Sonnet with both models in modelUsage
+        injectSession(agent, [
+            createAssistantMessage({ model: "claude-sonnet-4-20250514" }),
+            createResultMessageWithModel({
+                modelUsage: {
+                    "claude-opus-4-20250514": {
+                        inputTokens: 100,
+                        outputTokens: 50,
+                        cacheReadInputTokens: 20,
+                        cacheCreationInputTokens: 10,
+                        webSearchRequests: 0,
+                        costUSD: 0.01,
+                        contextWindow: 1000000,
+                        maxOutputTokens: 16384,
+                    },
+                    "claude-sonnet-4-20250514": {
+                        inputTokens: 50,
+                        outputTokens: 25,
+                        cacheReadInputTokens: 10,
+                        cacheCreationInputTokens: 5,
+                        webSearchRequests: 0,
+                        costUSD: 0.005,
+                        contextWindow: 200000,
+                        maxOutputTokens: 16384,
+                    },
+                },
+            }),
+            { type: "system", subtype: "session_state_changed", state: "idle" },
+        ]);
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+        const usageUpdate = updates.find((u) => u.update?.sessionUpdate === "usage_update");
+        expect(usageUpdate).toBeDefined();
+        // size should be 200000 (Sonnet - the current model)
+        expect(usageUpdate.update.size).toBe(200000);
+    });
+    it("after switching back to original model, size returns to original window", async () => {
+        const { agent, updates } = createMockAgentWithCapture();
+        // Last assistant message is Opus again
+        injectSession(agent, [
+            createAssistantMessage({ model: "claude-sonnet-4-20250514" }),
+            createAssistantMessage({ model: "claude-opus-4-20250514" }),
+            createResultMessageWithModel({
+                modelUsage: {
+                    "claude-opus-4-20250514": {
+                        inputTokens: 200,
+                        outputTokens: 100,
+                        cacheReadInputTokens: 40,
+                        cacheCreationInputTokens: 20,
+                        webSearchRequests: 0,
+                        costUSD: 0.02,
+                        contextWindow: 1000000,
+                        maxOutputTokens: 16384,
+                    },
+                    "claude-sonnet-4-20250514": {
+                        inputTokens: 50,
+                        outputTokens: 25,
+                        cacheReadInputTokens: 10,
+                        cacheCreationInputTokens: 5,
+                        webSearchRequests: 0,
+                        costUSD: 0.005,
+                        contextWindow: 200000,
+                        maxOutputTokens: 16384,
+                    },
+                },
+            }),
+            { type: "system", subtype: "session_state_changed", state: "idle" },
+        ]);
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+        const usageUpdate = updates.find((u) => u.update?.sessionUpdate === "usage_update");
+        expect(usageUpdate).toBeDefined();
+        // size should be 1000000 (Opus - switched back)
+        expect(usageUpdate.update.size).toBe(1000000);
+    });
+    it("subagent assistant messages do not affect size (top-level model is used)", async () => {
+        const { agent, updates } = createMockAgentWithCapture();
+        // Top-level assistant on Opus, then subagent on Haiku (parent_tool_use_id set)
+        injectSession(agent, [
+            createAssistantMessage({ model: "claude-opus-4-20250514" }),
+            {
+                type: "assistant",
+                parent_tool_use_id: "tool_use_123",
+                uuid: randomUUID(),
+                session_id: "test-session",
+                message: {
+                    model: "claude-haiku-4-5-20251001",
+                    content: [{ type: "text", text: "subagent response" }],
+                    usage: {
+                        input_tokens: 50,
+                        output_tokens: 25,
+                        cache_read_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                    },
+                },
+            },
+            createResultMessageWithModel({
+                modelUsage: {
+                    "claude-opus-4-20250514": {
+                        inputTokens: 100,
+                        outputTokens: 50,
+                        cacheReadInputTokens: 20,
+                        cacheCreationInputTokens: 10,
+                        webSearchRequests: 0,
+                        costUSD: 0.01,
+                        contextWindow: 1000000,
+                        maxOutputTokens: 16384,
+                    },
+                    "claude-haiku-4-5-20251001": {
+                        inputTokens: 50,
+                        outputTokens: 25,
+                        cacheReadInputTokens: 0,
+                        cacheCreationInputTokens: 0,
+                        webSearchRequests: 0,
+                        costUSD: 0.001,
+                        contextWindow: 200000,
+                        maxOutputTokens: 8192,
+                    },
+                },
+            }),
+            { type: "system", subtype: "session_state_changed", state: "idle" },
+        ]);
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+        const usageUpdate = updates.find((u) => u.update?.sessionUpdate === "usage_update");
+        expect(usageUpdate).toBeDefined();
+        // size should be 1000000 (Opus - the top-level model), NOT 200000 (Haiku subagent)
+        expect(usageUpdate.update.size).toBe(1000000);
+    });
+    it("prefix-matches when assistant model has date suffix but modelUsage key does not", async () => {
+        const { agent, updates } = createMockAgentWithCapture();
+        // The API response has the full versioned model ID on assistant messages,
+        // but the SDK's streaming path may key modelUsage by the shorter alias.
+        injectSession(agent, [
+            createAssistantMessage({ model: "claude-opus-4-6-20250514" }),
+            createResultMessageWithModel({
+                modelUsage: {
+                    "claude-opus-4-6": {
+                        inputTokens: 100,
+                        outputTokens: 50,
+                        cacheReadInputTokens: 20,
+                        cacheCreationInputTokens: 10,
+                        webSearchRequests: 0,
+                        costUSD: 0.01,
+                        contextWindow: 1000000,
+                        maxOutputTokens: 16384,
+                    },
+                },
+            }),
+            { type: "system", subtype: "session_state_changed", state: "idle" },
+        ]);
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+        const usageUpdate = updates.find((u) => u.update?.sessionUpdate === "usage_update");
+        expect(usageUpdate).toBeDefined();
+        // Should match via prefix: "claude-opus-4-6-20250514".startsWith("claude-opus-4-6")
+        expect(usageUpdate.update.size).toBe(1000000);
+    });
+    it("prefix-matches when modelUsage key has date suffix but assistant model does not", async () => {
+        const { agent, updates } = createMockAgentWithCapture();
+        injectSession(agent, [
+            createAssistantMessage({ model: "claude-opus-4-6" }),
+            createResultMessageWithModel({
+                modelUsage: {
+                    "claude-opus-4-6-20250514": {
+                        inputTokens: 100,
+                        outputTokens: 50,
+                        cacheReadInputTokens: 20,
+                        cacheCreationInputTokens: 10,
+                        webSearchRequests: 0,
+                        costUSD: 0.01,
+                        contextWindow: 1000000,
+                        maxOutputTokens: 16384,
+                    },
+                },
+            }),
+            { type: "system", subtype: "session_state_changed", state: "idle" },
+        ]);
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+        const usageUpdate = updates.find((u) => u.update?.sessionUpdate === "usage_update");
+        expect(usageUpdate).toBeDefined();
+        expect(usageUpdate.update.size).toBe(1000000);
+    });
+    it("synthetic assistant messages do not override lastAssistantModel", async () => {
+        const { agent, updates } = createMockAgentWithCapture();
+        // Real assistant on Opus, then a synthetic message (e.g. from /compact)
+        injectSession(agent, [
+            createAssistantMessage({ model: "claude-opus-4-20250514" }),
+            {
+                type: "assistant",
+                parent_tool_use_id: null,
+                uuid: randomUUID(),
+                session_id: "test-session",
+                message: {
+                    model: "<synthetic>",
+                    content: [{ type: "text", text: "compacted" }],
+                    usage: {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_read_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                    },
+                },
+            },
+            createResultMessageWithModel({
+                modelUsage: {
+                    "claude-opus-4-20250514": {
+                        inputTokens: 100,
+                        outputTokens: 50,
+                        cacheReadInputTokens: 20,
+                        cacheCreationInputTokens: 10,
+                        webSearchRequests: 0,
+                        costUSD: 0.01,
+                        contextWindow: 1000000,
+                        maxOutputTokens: 16384,
+                    },
+                },
+            }),
+            { type: "system", subtype: "session_state_changed", state: "idle" },
+        ]);
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+        const usageUpdate = updates.find((u) => u.update?.sessionUpdate === "usage_update");
+        expect(usageUpdate).toBeDefined();
+        // size should be 1000000 (Opus), not 200000 (the fallback if <synthetic> overrode the model)
+        expect(usageUpdate.update.size).toBe(1000000);
     });
 });
