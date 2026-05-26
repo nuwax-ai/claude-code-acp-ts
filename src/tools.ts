@@ -14,6 +14,9 @@ import {
   FileWriteInput,
   GlobInput,
   GrepInput,
+  TaskCreateInput,
+  TaskCreateOutput,
+  TaskUpdateInput,
   TodoWriteInput,
   WebFetchInput,
   WebSearchInput,
@@ -128,7 +131,7 @@ export function toolInfoFromToolUse(
   switch (name) {
     case "Agent":
     case "Task": {
-      const input = toolUse.input as AgentInput | BashInput;
+      const input = toolUse.input as AgentInput | BashInput | undefined;
       return {
         title: input?.description ? input.description : "Task",
         kind: "think",
@@ -145,7 +148,7 @@ export function toolInfoFromToolUse(
     }
 
     case "Bash": {
-      const input = toolUse.input as BashInput;
+      const input = toolUse.input as BashInput | undefined;
       return {
         title: input?.command ? input.command : "Terminal",
         kind: "execute",
@@ -163,18 +166,18 @@ export function toolInfoFromToolUse(
     }
 
     case "Read": {
-      const input = toolUse.input as FileReadInput;
+      const input = toolUse.input as FileReadInput | undefined;
       let limit = "";
-      if (input.limit && input.limit > 0) {
+      if (input?.limit && input.limit > 0) {
         limit = " (" + (input.offset ?? 1) + " - " + ((input.offset ?? 1) + input.limit - 1) + ")";
-      } else if (input.offset) {
+      } else if (input?.offset) {
         limit = " (from line " + input.offset + ")";
       }
-      const displayPath = input.file_path ? toDisplayPath(input.file_path, cwd) : "File";
+      const displayPath = input?.file_path ? toDisplayPath(input.file_path, cwd) : "File";
       return {
         title: "Read " + displayPath + limit,
         kind: "read",
-        locations: input.file_path
+        locations: input?.file_path
           ? [
               {
                 path: input.file_path,
@@ -187,7 +190,7 @@ export function toolInfoFromToolUse(
     }
 
     case "Write": {
-      const input = toolUse.input as FileWriteInput;
+      const input = toolUse.input as FileWriteInput | undefined;
       let content: ToolCallContent[] = [];
       if (input && input.file_path) {
         content = [
@@ -216,7 +219,7 @@ export function toolInfoFromToolUse(
     }
 
     case "Edit": {
-      const input = toolUse.input as FileEditInput;
+      const input = toolUse.input as FileEditInput | undefined;
       let content: ToolCallContent[] = [];
       if (input && input.file_path && (input.old_string || input.new_string)) {
         content = [
@@ -238,44 +241,44 @@ export function toolInfoFromToolUse(
     }
 
     case "Glob": {
-      const input = toolUse.input as GlobInput;
+      const input = toolUse.input as GlobInput | undefined;
       let label = "Find";
-      if (input.path) {
+      if (input?.path) {
         label += ` \`${input.path}\``;
       }
-      if (input.pattern) {
+      if (input?.pattern) {
         label += ` \`${input.pattern}\``;
       }
       return {
         title: label,
         kind: "search",
         content: [],
-        locations: input.path ? [{ path: input.path }] : [],
+        locations: input?.path ? [{ path: input.path }] : [],
       };
     }
 
     case "Grep": {
-      const input = toolUse.input as GrepInput;
+      const input = toolUse.input as GrepInput | undefined;
       let label = "grep";
 
-      if (input["-i"]) {
+      if (input?.["-i"]) {
         label += " -i";
       }
-      if (input["-n"]) {
+      if (input?.["-n"]) {
         label += " -n";
       }
 
-      if (input["-A"] !== undefined) {
+      if (input?.["-A"] !== undefined) {
         label += ` -A ${input["-A"]}`;
       }
-      if (input["-B"] !== undefined) {
+      if (input?.["-B"] !== undefined) {
         label += ` -B ${input["-B"]}`;
       }
-      if (input["-C"] !== undefined) {
+      if (input?.["-C"] !== undefined) {
         label += ` -C ${input["-C"]}`;
       }
 
-      if (input.output_mode) {
+      if (input?.output_mode) {
         switch (input.output_mode) {
           case "files_with_matches":
             label += " -l";
@@ -289,27 +292,27 @@ export function toolInfoFromToolUse(
         }
       }
 
-      if (input.head_limit !== undefined) {
+      if (input?.head_limit !== undefined) {
         label += ` | head -${input.head_limit}`;
       }
 
-      if (input.glob) {
+      if (input?.glob) {
         label += ` --include="${input.glob}"`;
       }
 
-      if (input.type) {
+      if (input?.type) {
         label += ` --type=${input.type}`;
       }
 
-      if (input.multiline) {
+      if (input?.multiline) {
         label += " -P";
       }
 
-      if (input.pattern) {
+      if (input?.pattern) {
         label += ` "${input.pattern}"`;
       }
 
-      if (input.path) {
+      if (input?.path) {
         label += ` ${input.path}`;
       }
 
@@ -338,14 +341,14 @@ export function toolInfoFromToolUse(
     }
 
     case "WebSearch": {
-      const input = toolUse.input as WebSearchInput;
-      let label = `"${input.query}"`;
+      const input = toolUse.input as WebSearchInput | undefined;
+      let label = input?.query ? `"${input.query}"` : "Web search";
 
-      if (input.allowed_domains && input.allowed_domains.length > 0) {
+      if (input?.allowed_domains && input.allowed_domains.length > 0) {
         label += ` (allowed: ${input.allowed_domains.join(", ")})`;
       }
 
-      if (input.blocked_domains && input.blocked_domains.length > 0) {
+      if (input?.blocked_domains && input.blocked_domains.length > 0) {
         label += ` (blocked: ${input.blocked_domains.join(", ")})`;
       }
 
@@ -357,7 +360,7 @@ export function toolInfoFromToolUse(
     }
 
     case "TodoWrite": {
-      const input = toolUse.input as TodoWriteInput;
+      const input = toolUse.input as TodoWriteInput | undefined;
       return {
         title: Array.isArray(input?.todos)
           ? `Update TODOs: ${input.todos.map((todo: any) => todo.content).join(", ")}`
@@ -367,8 +370,42 @@ export function toolInfoFromToolUse(
       };
     }
 
+    case "TaskCreate": {
+      const input = toolUse.input as TaskCreateInput | undefined;
+      return {
+        title: input?.subject ? `Create task: ${input.subject}` : "Create task",
+        kind: "think",
+        content: [],
+      };
+    }
+
+    case "TaskUpdate": {
+      const input = toolUse.input as TaskUpdateInput | undefined;
+      return {
+        title: input?.subject ? `Update task: ${input.subject}` : "Update task",
+        kind: "think",
+        content: [],
+      };
+    }
+
+    case "TaskList": {
+      return {
+        title: "List tasks",
+        kind: "think",
+        content: [],
+      };
+    }
+
+    case "TaskGet": {
+      return {
+        title: "Get task",
+        kind: "think",
+        content: [],
+      };
+    }
+
     case "ExitPlanMode": {
-      const planInput = toolUse.input as { plan?: string };
+      const planInput = toolUse.input as { plan?: string } | undefined;
       return {
         title: "Ready to code?",
         kind: "switch_mode",
@@ -661,10 +698,107 @@ export type ClaudePlanEntry = {
   activeForm: string;
 };
 
-export function planEntries(input: { todos: ClaudePlanEntry[] }): PlanEntry[] {
-  return input.todos.map((input) => ({
-    content: input.content,
-    status: input.status,
+export function planEntries(input: { todos: ClaudePlanEntry[] } | undefined): PlanEntry[] {
+  return (input?.todos ?? []).map((todo) => ({
+    content: todo.content,
+    status: todo.status,
+    priority: "medium",
+  }));
+}
+
+/**
+ * Per-session task list accumulated from Task* tool calls (TaskCreate /
+ * TaskUpdate). The headless/SDK session emits these as incremental tool
+ * calls keyed by task ID, replacing the snapshot-style TodoWrite tool.
+ * Iteration order is insertion order (Map semantics), matching the order
+ * tasks are created.
+ */
+export type TaskEntry = {
+  subject: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm?: string;
+  description?: string;
+};
+export type TaskState = Map<string, TaskEntry>;
+
+/**
+ * Best-effort parse of a TaskCreate tool_result content into the structured
+ * TaskCreateOutput. The SDK delivers tool outputs either as a string or as
+ * an array of TextBlockParam-like blocks containing JSON text; try both.
+ */
+export function parseTaskCreateOutput(content: unknown): TaskCreateOutput | undefined {
+  const tryParse = (text: string): TaskCreateOutput | undefined => {
+    try {
+      const parsed = JSON.parse(text);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        parsed.task &&
+        typeof parsed.task.id === "string"
+      ) {
+        return parsed as TaskCreateOutput;
+      }
+    } catch {
+      // ignore
+    }
+    return undefined;
+  };
+
+  if (typeof content === "string") {
+    return tryParse(content);
+  }
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === "object" && "type" in block && block.type === "text") {
+        const text = (block as { text?: unknown }).text;
+        if (typeof text === "string") {
+          const parsed = tryParse(text);
+          if (parsed) return parsed;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+export function applyTaskCreate(
+  state: TaskState,
+  input: TaskCreateInput | undefined,
+  output: TaskCreateOutput | undefined,
+): void {
+  const taskId = output?.task?.id;
+  if (!taskId || !input) return;
+  state.set(taskId, {
+    subject: input.subject,
+    status: "pending",
+    activeForm: input.activeForm,
+    description: input.description,
+  });
+}
+
+export function applyTaskUpdate(state: TaskState, input: TaskUpdateInput | undefined): void {
+  if (!input?.taskId) return;
+  if (input.status === "deleted") {
+    state.delete(input.taskId);
+    return;
+  }
+  const existing = state.get(input.taskId);
+  // Without a subject from either the existing entry or the update payload,
+  // we'd produce a plan entry with empty `content` — drop the update.
+  const subject = input.subject ?? existing?.subject;
+  if (!subject) return;
+  state.set(input.taskId, {
+    subject,
+    status: input.status ?? existing?.status ?? "pending",
+    activeForm: input.activeForm ?? existing?.activeForm,
+    description: input.description ?? existing?.description,
+  });
+}
+
+export function taskStateToPlanEntries(state: TaskState): PlanEntry[] {
+  return Array.from(state.values()).map((task) => ({
+    content: task.subject,
+    status: task.status,
     priority: "medium",
   }));
 }
@@ -679,7 +813,7 @@ export function markdownEscape(text: string): string {
   return escape + "\n" + text + (text.endsWith("\n") ? "" : "\n") + escape;
 }
 
-interface EditToolResponseHunk {
+interface DiffToolResponseHunk {
   oldStart: number;
   oldLines: number;
   newStart: number;
@@ -687,23 +821,24 @@ interface EditToolResponseHunk {
   lines: string[];
 }
 
-interface EditToolResponse {
+interface DiffToolResponse {
   filePath?: string;
-  structuredPatch?: EditToolResponseHunk[];
+  structuredPatch?: DiffToolResponseHunk[];
 }
 
 /**
- * Builds diff ToolUpdate content from the structured Edit toolResponse provided
- * by the PostToolUse hook. Unlike parsing the plain unified diff string, this uses
- * the pre-parsed structuredPatch which supports multiple replacement sites (replaceAll)
- * and always includes context lines for better readability.
+ * Builds diff ToolUpdate content from the structured toolResponse provided by
+ * the PostToolUse hook for diff-producing tools (Edit, Write). Unlike parsing
+ * the plain unified diff string, this uses the pre-parsed structuredPatch
+ * which supports multiple replacement sites (replaceAll) and always includes
+ * context lines for better readability.
  */
-export function toolUpdateFromEditToolResponse(toolResponse: unknown): {
+export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
   content?: ToolCallContent[];
   locations?: ToolCallLocation[];
 } {
   if (!toolResponse || typeof toolResponse !== "object") return {};
-  const response = toolResponse as EditToolResponse;
+  const response = toolResponse as DiffToolResponse;
   if (!response.filePath || !Array.isArray(response.structuredPatch)) return {};
 
   const content: ToolCallContent[] = [];
@@ -793,6 +928,41 @@ export const createPostToolUseHook =
           delete toolUseCallbacks[toolUseID];
         }
       }
+    }
+    return { continue: true };
+  };
+
+/**
+ * Hook callback for `TaskCreated` / `TaskCompleted` events. The SDK fires
+ * these for both user-facing TaskCreate tool calls and subagent task
+ * creation, giving us `task_id` + `task_subject` without having to parse
+ * tool_result payloads.
+ *
+ * Populating `taskState` from the hook means a later `TaskUpdate` (which
+ * typically only carries `taskId` + `status`) finds an existing entry with
+ * a real subject, instead of synthesizing a placeholder with empty content.
+ */
+export const createTaskHook =
+  (options: { taskState: TaskState; onChange?: () => Promise<void> }): HookCallback =>
+  async (input): Promise<{ continue: boolean }> => {
+    const taskId =
+      "task_id" in input && typeof input.task_id === "string" ? input.task_id : undefined;
+    if (!taskId) return { continue: true };
+
+    if (input.hook_event_name === "TaskCreated") {
+      if (!input.task_subject) return { continue: true };
+      if (options.taskState.has(taskId)) return { continue: true };
+      options.taskState.set(taskId, {
+        subject: input.task_subject,
+        status: "pending",
+        description: input.task_description,
+      });
+      if (options.onChange) await options.onChange();
+    } else if (input.hook_event_name === "TaskCompleted") {
+      const existing = options.taskState.get(taskId);
+      if (!existing || existing.status === "completed") return { continue: true };
+      options.taskState.set(taskId, { ...existing, status: "completed" });
+      if (options.onChange) await options.onChange();
     }
     return { continue: true };
   };

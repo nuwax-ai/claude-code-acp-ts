@@ -15,9 +15,17 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
     capturedOptions = options;
     return {
       initializationResult: async () => ({
-        models: [{ value: "claude-sonnet-4-5", displayName: "Claude Sonnet", description: "Fast" }],
+        models: [
+          {
+            value: "claude-sonnet-4-6",
+            displayName: "Claude Sonnet",
+            description: "Fast",
+            supportsAutoMode: true,
+          },
+        ],
       }),
       setModel: async () => {},
+      setPermissionMode: async () => {},
       supportedCommands: async () => [],
       [Symbol.asyncIterator]: async function* () {},
     };
@@ -67,5 +75,34 @@ describe("additionalRoots", () => {
       claudeCode: { options: { additionalDirectories: ["/workspace/shared"] } },
     });
     expect(capturedOptions!.additionalDirectories).toEqual(["/workspace/shared", "", root]);
+  });
+
+  it("prefers the official ACP additionalDirectories field over _meta.additionalRoots", async () => {
+    await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+      additionalDirectories: ["/from/official"],
+      _meta: { additionalRoots: ["/from/meta"] },
+    });
+    expect(capturedOptions!.additionalDirectories).toEqual(["/from/official"]);
+  });
+
+  it("merges official ACP additionalDirectories with claudeCode SDK additionalDirectories", async () => {
+    await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+      additionalDirectories: ["/from/official"],
+      _meta: { claudeCode: { options: { additionalDirectories: ["/from/sdk"] } } },
+    });
+    expect(capturedOptions!.additionalDirectories).toEqual(["/from/sdk", "/from/official"]);
+  });
+
+  it("falls back to _meta.additionalRoots when the official field is omitted", async () => {
+    await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+      _meta: { additionalRoots: ["/from/meta"] },
+    });
+    expect(capturedOptions!.additionalDirectories).toEqual(["/from/meta"]);
   });
 });
