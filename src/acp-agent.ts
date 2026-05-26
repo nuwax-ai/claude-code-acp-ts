@@ -1984,7 +1984,7 @@ export class ClaudeAcpAgent implements Agent {
     const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
 
     // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
-    const disallowedTools = ["AskUserQuestion"];
+    const disallowedTools = ["AskUserQuestion", "WebFetch", "WebSearch"];
 
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
