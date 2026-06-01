@@ -735,14 +735,6 @@ export class ClaudeAcpAgent implements Agent {
       throw new Error("Session not found");
     }
 
-    session.cancelled = false;
-    session.accumulatedUsage = {
-      inputTokens: 0,
-      outputTokens: 0,
-      cachedReadTokens: 0,
-      cachedWriteTokens: 0,
-    };
-
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
     let lastAssistantModel: string | null = null;
@@ -778,6 +770,20 @@ export class ClaudeAcpAgent implements Agent {
     } else {
       session.input.push(userMessage);
     }
+
+    // Reset session state only when this prompt is about to execute (not
+    // while queued).  Previously this ran before the queue check, which
+    // created a race: a cancel()+new-prompt sequence would reset
+    // `session.cancelled` to false before the in-flight prompt's while-loop
+    // could observe the cancelled flag, causing it to return `end_turn` with
+    // zero usage instead of `cancelled`.
+    session.cancelled = false;
+    session.accumulatedUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+    };
 
     session.promptRunning = true;
     let handedOff = false;
