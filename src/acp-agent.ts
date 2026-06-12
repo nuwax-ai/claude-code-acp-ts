@@ -2507,10 +2507,7 @@ export class ClaudeAcpAgent implements Agent {
       url: !!this.clientCapabilities?.elicitation?.url,
     };
 
-    // AskUserQuestion surfaces as a `permission_ask_user_question` dialog that
-    // we render as a form elicitation. Without form-elicitation support there
-    // is no way to present it over ACP, so keep it disabled in that case.
-    const disallowedTools = elicitationSupport.form ? [] : ["AskUserQuestion"];
+    const disallowedTools = ["AskUserQuestion", "WebFetch", "WebSearch"];
 
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
