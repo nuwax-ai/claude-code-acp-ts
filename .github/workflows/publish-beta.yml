@@ -21,6 +21,15 @@ jobs:
         run: npm install -g npm@latest
       - run: npm ci
       - run: npm run build
+
+      # Use the version derived from the git tag as the single source of truth,
+      # instead of reading package.json. ${GITHUB_REF_NAME} is the tag name (e.g. v0.52.0-beta.1).
+      - name: Set version from git tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "Publishing version from tag: $TAG_VERSION"
+          npm version "$TAG_VERSION" --no-git-tag-version --allow-same-version
+
       - run: npm publish --tag beta
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
