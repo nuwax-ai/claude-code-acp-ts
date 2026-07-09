@@ -113,17 +113,17 @@ describe("session config options", () => {
       settingsManager: {},
       modes: structuredClone(MOCK_MODES),
       models: structuredClone(MOCK_MODELS),
-      modelInfos: MOCK_MODELS.availableModels.map(
-        (m): ModelInfo => ({
-          value: m.modelId,
-          displayName: m.name,
-          description: m.description,
-          supportsEffort: true,
-          supportedEffortLevels: ["low", "medium", "high"],
-        }),
-      ),
+      modelInfos: MOCK_MODELS.availableModels.map((m): ModelInfo => ({
+        value: m.modelId,
+        displayName: m.name,
+        description: m.description,
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "medium", "high"],
+      })),
       configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
       contextWindowSize: 200000,
+      toolUseCache: {},
+      emittedToolCalls: new Set(),
     };
   }
 
@@ -819,6 +819,85 @@ describe("session config options", () => {
       expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
     });
 
+    // Option entries carry no resolvedModel, so alias resolution must consult
+    // session.modelInfos — otherwise a full model id in either hint spelling
+    // ("[1m]"/"-1m") falls to the substring tier and lands on the bare 200k
+    // sibling, silently downgrading the session's context lane.
+    it("resolves a full model id onto its hinted row via session.modelInfos", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.models = {
+        currentModelId: "sonnet",
+        availableModels: [
+          { modelId: "sonnet", name: "Sonnet", description: "" },
+          { modelId: "sonnet[1m]", name: "Sonnet", description: "" },
+        ],
+      };
+      session.modelInfos = [
+        {
+          value: "sonnet",
+          resolvedModel: "claude-sonnet-5",
+          displayName: "Sonnet",
+          description: "",
+        },
+        {
+          value: "sonnet[1m]",
+          resolvedModel: "claude-sonnet-5[1m]",
+          displayName: "Sonnet",
+          description: "",
+        },
+      ];
+      session.configOptions = session.configOptions.map((o: { id: string }) =>
+        o.id === "model"
+          ? {
+              ...o,
+              currentValue: "sonnet",
+              options: [
+                { value: "sonnet", name: "Sonnet" },
+                { value: "sonnet[1m]", name: "Sonnet" },
+              ],
+            }
+          : o,
+      );
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-5[1m]",
+      });
+      expect(setModelSpy).toHaveBeenCalledWith("sonnet[1m]");
+
+      setModelSpy.mockClear();
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-5-1m",
+      });
+      expect(setModelSpy).toHaveBeenCalledWith("sonnet[1m]");
+    });
+
+    // A session can be running a model with no picker entry (resumed onto a
+    // model excluded by the availableModels allowlist, or a refusal
+    // fallback); its verbatim id is then the option's currentValue. A client
+    // round-tripping that reported value must not get "Invalid value".
+    it("accepts the reported currentValue even when it has no options entry", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.models = { ...session.models, currentModelId: "claude-offlist-9" };
+      session.configOptions = session.configOptions.map((o: { id: string }) =>
+        o.id === "model" ? { ...o, currentValue: "claude-offlist-9" } : o,
+      );
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-offlist-9",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-offlist-9");
+      expect(response.configOptions?.find((o) => o.id === "model")?.currentValue).toBe(
+        "claude-offlist-9",
+      );
+    });
+
     it("setSessionMode also syncs configOptions", async () => {
       await agent.setSessionMode({ sessionId: SESSION_ID, modeId: "plan" });
 
@@ -1113,6 +1192,10 @@ describe("session config options", () => {
         ],
       };
 
+      // The tool_call was already surfaced (by the streamed tool_use chunk), so
+      // the permission request won't re-emit one — keep this focused on options.
+      session.emittedToolCalls.add("toolu_1");
+
       const canUseTool = (agent as any).canUseTool(SESSION_ID);
       const signal = new AbortController().signal;
       try {
@@ -1144,6 +1227,10 @@ describe("session config options", () => {
         ],
       };
       permissionResponse = { outcome: { outcome: "selected", optionId: "auto" } };
+      // The tool_call was already surfaced (by the streamed tool_use chunk), so
+      // the permission request won't re-emit one — the deny path below should
+      // produce no session updates at all.
+      session.emittedToolCalls.add("toolu_2");
 
       const canUseTool = (agent as any).canUseTool(SESSION_ID);
       const result = await canUseTool(
@@ -1171,6 +1258,10 @@ describe("session config options", () => {
           { id: "dontAsk", name: "Don't Ask", description: "Deny if not pre-approved" },
         ],
       };
+
+      // The tool_call was already surfaced (by the streamed tool_use chunk), so
+      // the permission request won't re-emit one — keep this focused on options.
+      session.emittedToolCalls.add("toolu_3");
 
       const canUseTool = (agent as any).canUseTool(SESSION_ID);
       const signal = new AbortController().signal;
