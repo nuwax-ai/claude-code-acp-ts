@@ -3,5 +3,5 @@ node_modules
 .DS_Store
 .claude/*.local.*
 CLAUDE.local.md
-.idea
+.idea/
 dist
