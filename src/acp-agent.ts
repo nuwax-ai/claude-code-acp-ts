@@ -1704,11 +1704,13 @@ export class ClaudeAcpAgent {
     // stop_reason "refusal" and structured stop_details. We capture the
     // human-readable explanation so the terminal `result` can surface it.
     let lastRefusalExplanation: string | null = null;
-    // Tracks whether we're inside a compaction. The SDK emits the terminal
+    // Tracks an in-progress compaction by the toolCallId stamped on its
+    // `tool_call`. `null` = no compaction in flight. The SDK emits the terminal
     // `status` (compact_result success/failed) twice for a single failed
     // compaction, and the two messages are indistinguishable — so we report the
-    // outcome only while a compaction is in progress, then clear this.
-    let compactionInProgress = false;
+    // outcome only while a compaction is in progress, then clear this back to
+    // `null` so the duplicate terminal message is a no-op.
+    let compactionToolCallId: string | null = null;
     // Anthropic API message id of the assistant message currently being
     // streamed, captured from `message_start` so the streamed chunks that follow
     // (whose delta events don't carry it) can all be tagged with the same,
@@ -1761,7 +1763,7 @@ export class ClaudeAcpAgent {
       lastAssistantModel = null;
       lastAssistantError = undefined;
       lastRefusalExplanation = null;
-      compactionInProgress = false;
+      compactionToolCallId = null;
       // Do NOT reset currentStreamMessageId or streamedBlocks here. Turn
       // activation can fire mid-message (the replayed user echo with
       // --replay-user-messages lands between a message's blocks); clearing the
@@ -2329,39 +2331,61 @@ export class ClaudeAcpAgent {
                 await this.syncFastModeState(message.session_id, session, message.fast_mode_state);
                 break;
               case "status": {
-                // These banners count as delivered text (via sendUpdate), so
-                // an echo-less turn that only ever emits them (e.g. `/compact`,
-                // promoted at its own result) doesn't have its result text
-                // re-emitted by the issue-#453 fallback.
+                // Surface compaction as a tool call so the client renders it as
+                // a discrete, stateful operation (in_progress → completed/
+                // failed) instead of interleaved assistant prose. The
+                // `compacting` start also marks the turn's answer as delivered:
+                // an echo-less turn that only ever compacts (e.g. `/compact`,
+                // promoted at its own result) must not have its result text
+                // re-emitted by the issue-#453 fallback. `sendUpdate` only
+                // latches that flag for `agent_message_chunk`, so set it
+                // explicitly here — the `tool_call` itself isn't assistant text.
                 if (message.status === "compacting") {
-                  compactionInProgress = true;
+                  compactionToolCallId = randomUUID();
+                  session.emittedAssistantText = true;
                   await sendUpdate({
                     sessionId: message.session_id,
                     update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "Compacting..." },
+                      sessionUpdate: "tool_call",
+                      toolCallId: compactionToolCallId,
+                      title: "Compacting",
+                      kind: "other",
+                      status: "in_progress",
+                      _meta: {
+                        claudeCode: { toolName: "compact" },
+                      } satisfies ToolUpdateMeta,
                     },
                   });
-                } else if (message.compact_result === "success" && compactionInProgress) {
+                } else if (message.compact_result === "success" && compactionToolCallId !== null) {
                   // The SDK signals manual `/compact` completion with a status
                   // message carrying `compact_result`, not the `compact_boundary`
                   // message (which only fires when there's content to compact).
-                  compactionInProgress = false;
+                  const toolCallId = compactionToolCallId;
+                  compactionToolCallId = null;
                   await sendUpdate({
                     sessionId: message.session_id,
                     update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "\n\nCompacting completed." },
+                      sessionUpdate: "tool_call_update",
+                      toolCallId,
+                      status: "completed",
                     },
                   });
-                } else if (message.compact_result === "failed" && compactionInProgress) {
-                  compactionInProgress = false;
-                  const reason = message.compact_error ? `: ${message.compact_error}` : ".";
+                } else if (message.compact_result === "failed" && compactionToolCallId !== null) {
+                  const toolCallId = compactionToolCallId;
+                  compactionToolCallId = null;
+                  const reason = message.compact_error ? `: ${message.compact_error}` : "";
                   await sendUpdate({
                     sessionId: message.session_id,
                     update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: `\n\nCompacting failed${reason}` },
+                      sessionUpdate: "tool_call_update",
+                      toolCallId,
+                      status: "failed",
+                      content: [
+                        {
+                          type: "content",
+                          content: { type: "text", text: `Compacting failed${reason}` },
+                        },
+                      ],
                     },
                   });
                 }

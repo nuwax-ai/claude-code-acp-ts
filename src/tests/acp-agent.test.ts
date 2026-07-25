@@ -216,6 +216,8 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
   class TestClient {
     files: Map<string, string> = new Map();
     receivedText: string = "";
+    // Collected `tool_call` / `tool_call_update` notifications (e.g. compaction).
+    toolCalls: any[] = [];
     // Records for the AskUserQuestion elicitation test.
     elicitations: CreateElicitationRequest[] = [];
     permissionToolInputs: unknown[] = [];
@@ -282,6 +284,10 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
         }
         case "available_commands_update":
           this.resolveAvailableCommands(params.update.availableCommands);
+          break;
+        case "tool_call":
+        case "tool_call_update":
+          this.toolCalls.push(params.update);
           break;
         default:
           break;
@@ -444,7 +450,19 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       sessionId: newSessionResponse.sessionId,
     });
 
-    expect(client.takeReceivedText()).toContain("Compacting...\n\nCompacting completed.");
+    // Compaction surfaces as a `tool_call` lifecycle (in_progress → completed),
+    // not as interleaved agent_message_chunk text.
+    const compactCalls = client.toolCalls.filter(
+      (u) => u._meta?.claudeCode?.toolName === "compact",
+    );
+    expect(
+      compactCalls.some((u) => u.sessionUpdate === "tool_call" && u.status === "in_progress"),
+    ).toBe(true);
+    expect(
+      compactCalls.some(
+        (u) => u.sessionUpdate === "tool_call_update" && u.status === "completed",
+      ),
+    ).toBe(true);
   }, 60000);
 
   // Regression guard for the SDK's AskUserQuestion routing. The built-in
@@ -6034,7 +6052,15 @@ describe("assembled assistant text fallback", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
 
-    expect(messageChunkTexts(updates)).toEqual(["Compacting..."]);
+    // Compaction now surfaces as a `tool_call` (in_progress) instead of an
+    // `agent_message_chunk`. That tool call still counts as the turn's
+    // delivered output, so the replayed result text ("conversation summarized")
+    // must NOT be re-forwarded by the issue-#453 fallback — hence no
+    // agent_message_chunk at all.
+    const toolCalls = updates.filter((u) => u.update?.sessionUpdate === "tool_call");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0].update.status).toBe("in_progress");
+    expect(messageChunkTexts(updates)).toEqual([]);
   });
 
   // Like injectSession, but serves two prompts: each turn's echo is yielded
