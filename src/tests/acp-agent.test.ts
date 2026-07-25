@@ -459,9 +459,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       compactCalls.some((u) => u.sessionUpdate === "tool_call" && u.status === "in_progress"),
     ).toBe(true);
     expect(
-      compactCalls.some(
-        (u) => u.sessionUpdate === "tool_call_update" && u.status === "completed",
-      ),
+      compactCalls.some((u) => u.sessionUpdate === "tool_call_update" && u.status === "completed"),
     ).toBe(true);
   }, 60000);
 
