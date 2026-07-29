@@ -5231,7 +5231,11 @@ export class ClaudeAcpAgent {
       url: !!this.clientCapabilities?.elicitation?.url,
     };
 
-    const disallowedTools = ["AskUserQuestion", "WebFetch", "WebSearch"];
+    // `Skill(dataviz)` disables the dataviz skill via the same parameterized
+    // `Skill(<name>)` form the SDK emits for its `skills` allowlist, so the
+    // skill is rejected at the tool-call layer rather than routed through
+    // settings. Force-disabled for every session this adapter starts.
+    const disallowedTools = ["AskUserQuestion", "WebFetch", "WebSearch", "Skill(dataviz)"];
 
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
