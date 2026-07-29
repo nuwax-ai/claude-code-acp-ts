@@ -70,6 +70,7 @@ import {
   OnElicitation,
   OnUserDialog,
   Options,
+  Settings,
   PermissionMode,
   PermissionResult,
   PermissionUpdate,
@@ -140,6 +141,43 @@ function sanitizeTitle(text: string): string {
     return sanitized;
   }
   return sanitized.slice(0, MAX_TITLE_LENGTH - 1) + "…";
+}
+
+/**
+ * Skills to force-disable in every session this adapter starts. Each entry is
+ * applied two ways for defense in depth: hidden from the model's skill listing
+ * via `skillOverrides: "off"` (injected into `options.settings`), and rejected
+ * at the tool-call layer via `disallowedTools: "Skill(<name>")`. Add a skill's
+ * command name here to disable it in both places.
+ */
+const DISABLED_SKILLS = ["dataviz"] as const;
+
+/**
+ * Merge forced skill disables into an SDK `settings` value (`Options.settings`),
+ * which may be a path string, a `Settings` object, or `undefined`. Each entry
+ * becomes `skillOverrides: "off"`, hiding it from the model's skill listing.
+ *
+ * A path string is returned unchanged: when a caller supplies settings via a
+ * file path (`_meta.claudeCode.options.settings`) they own that layer wholesale,
+ * and rewriting it would drop the rest of their configuration. In every other
+ * case the overrides are merged in — they win over any inherited value because
+ * flag settings sit at the top of the SDK's settings merge order.
+ */
+function withDisabledSkills(
+  settings: string | Settings | undefined,
+  disabled: readonly string[],
+): string | Settings {
+  if (typeof settings === "string") return settings;
+  const overrides = Object.fromEntries(
+    disabled.map((name) => [name, "off"] as const),
+  ) as NonNullable<Settings["skillOverrides"]>;
+  return {
+    ...(settings ?? {}),
+    skillOverrides: {
+      ...(settings?.skillOverrides ?? {}),
+      ...overrides,
+    },
+  };
 }
 
 /**
@@ -5231,11 +5269,16 @@ export class ClaudeAcpAgent {
       url: !!this.clientCapabilities?.elicitation?.url,
     };
 
-    // `Skill(dataviz)` disables the dataviz skill via the same parameterized
-    // `Skill(<name>)` form the SDK emits for its `skills` allowlist, so the
-    // skill is rejected at the tool-call layer rather than routed through
-    // settings. Force-disabled for every session this adapter starts.
-    const disallowedTools = ["AskUserQuestion", "WebFetch", "WebSearch", "Skill(dataviz)"];
+    // `Skill(<name>)` uses the same parameterized form the SDK emits for its
+    // `skills` allowlist, rejecting the call at the tool-call layer. Paired
+    // with the `skillOverrides: "off"` injection below, each DISABLED_SKILLS
+    // entry is both hidden from the model and uncallable.
+    const disallowedTools = [
+      "AskUserQuestion",
+      "WebFetch",
+      "WebSearch",
+      ...DISABLED_SKILLS.map((name) => `Skill(${name})`),
+    ];
 
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
@@ -5390,6 +5433,13 @@ export class ClaudeAcpAgent {
       ...creationOpts,
       abortController,
     };
+
+    // Hide each DISABLED_SKILLS entry from the model's skill listing by
+    // injecting `skillOverrides: "off"` at the flag-settings layer (the
+    // highest-priority user-controlled layer). `Options.settings` is the SDK
+    // equivalent of `--settings`. Paired with the `Skill(<name>)` entries in
+    // `disallowedTools` above for defense in depth.
+    options.settings = withDisabledSkills(options.settings, DISABLED_SKILLS);
 
     // Prefer the official ACP `additionalDirectories` field. Fall back to the
     // legacy `_meta.additionalRoots` extension for clients that haven't been

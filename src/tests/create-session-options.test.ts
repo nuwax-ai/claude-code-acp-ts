@@ -377,6 +377,7 @@ describe("createSession options merging", () => {
 
       expect(capturedOptions!.settings).toEqual({
         modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        skillOverrides: { dataviz: "off" },
       });
     });
 
@@ -389,6 +390,7 @@ describe("createSession options merging", () => {
 
       expect(capturedOptions!.settings).toEqual({
         availableModels: ["opus", "sonnet"],
+        skillOverrides: { dataviz: "off" },
       });
     });
 
@@ -403,13 +405,18 @@ describe("createSession options merging", () => {
       expect(capturedOptions!.settings).toEqual({
         modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
         availableModels: ["opus"],
+        skillOverrides: { dataviz: "off" },
       });
     });
 
-    it("does not add settings when env var is not set", async () => {
+    it("does not add modelConfig settings when env var is not set", async () => {
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-      expect(capturedOptions!.settings).toBeUndefined();
+      // No modelConfig is injected, but the adapter still force-disables its
+      // hard-coded skills via the flag-settings layer.
+      expect(capturedOptions!.settings).toEqual({
+        skillOverrides: { dataviz: "off" },
+      });
     });
 
     it("ignores env var when _meta provides settings", async () => {
@@ -436,6 +443,7 @@ describe("createSession options merging", () => {
       expect(capturedOptions!.settings).toEqual({
         model: "claude-sonnet-4-6",
         modelOverrides: { "claude-opus-4-6": "meta-value" },
+        skillOverrides: { dataviz: "off" },
       });
     });
 
