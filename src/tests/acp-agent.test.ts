@@ -8909,6 +8909,31 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     },
   });
 
+  /** A top-level assistant message carrying an Agent/Task tool_use block —
+   *  the early signal that populates pendingSubagentToolUseIds. The toolUseId
+   *  must match the task_started/task_notification tool_use_id for the same
+   *  spawn (subagentStarted/taskNotification use `toolu_<taskId>`). */
+  const assistantWithSubagentToolUse = (toolUseId: string, name = "Agent") => ({
+    type: "assistant" as const,
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: "test-session",
+    message: {
+      role: "assistant" as const,
+      model: "claude-sonnet-4-5",
+      stop_reason: "tool_use",
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      content: [
+        { type: "tool_use", id: toolUseId, name, input: { description: "explore" } },
+      ],
+    },
+  });
+
   it("holds the prompt open while a subagent is live and resolves at the followup's result", async () => {
     const { agent, events } = chunkCapturingAgent();
 
@@ -9798,6 +9823,202 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await expect(
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "next" }] }),
     ).rejects.toMatchObject({ code: -32603 });
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("does not orphan a subagent when task_started arrives after the result", async () => {
+    // A fast model dispatches a background subagent and immediately end_turns,
+    // so the terminal result can beat task_started. Pre-fix the turn settled
+    // at the result and the subagent was orphaned (output lost, the followup
+    // summary landed after the prompt resolved). pendingSubagentToolUseIds
+    // holds the turn open on the tool_use id alone until task_started arrives.
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        // The tool_use block always precedes task_started and the result.
+        yield assistantWithSubagentToolUse("toolu_agent-1");
+        // Result arrives BEFORE task_started — the race the fix targets.
+        yield resultMessage();
+        yield idle(); // pending non-empty — the hold survives
+        // task_started arrives late — converts pending to spawnedTaskIds.
+        yield subagentStarted("agent-1");
+        yield idle();
+        // The subagent finishes; the model wakes for the followup summary,
+        // which must land inside the still-open turn.
+        yield taskNotification("agent-1");
+        yield assistantText("promised summary");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "explore" }] })
+      .then((r) => {
+        events.push("resolved");
+        return r;
+      });
+
+    expect(response.stopReason).toBe("end_turn");
+    // The followup summary streamed BEFORE the prompt resolved, i.e. inside
+    // the turn — the subagent was NOT orphaned despite task_started losing
+    // the race with the result.
+    const summaryIndex = events.indexOf("chunk:promised summary");
+    expect(summaryIndex).toBeGreaterThanOrEqual(0);
+    expect(summaryIndex).toBeLessThan(events.indexOf("resolved"));
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("does not seed pending from a replayed assistant message (resume/loadSession history)", async () => {
+    // A resumed session replays its recorded assistant messages (isReplay),
+    // which may carry old Agent/Task tool_use. Those are history, not a live
+    // spawn — task_started/task_notification are runtime events that don't
+    // replay — so they must NOT seed the new turn's pending, or the turn's
+    // own result would defer on a stale id and the prompt would hang until a
+    // hand-off/cancel.
+    const agent = createMockAgent();
+    let releaseIdle!: () => void;
+    const idleGate = new Promise<void>((resolve) => (releaseIdle = resolve));
+    let idleYielded = false;
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield { ...assistantWithSubagentToolUse("toolu_old"), isReplay: true };
+        yield resultMessage(); // no live subagent → must settle immediately
+        await idleGate;
+        idleYielded = true;
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "resume" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+    // Settled at the result, NOT deferred on the stale replayed pending.
+    expect(idleYielded).toBe(false);
+    releaseIdle();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("settles immediately for a foreground (sync) subagent that completes before the result", async () => {
+    // A sync subagent's task_started and task_notification both precede the
+    // result, so pending is cleared and the task is pruned by result time —
+    // the turn must still settle at its result (no added latency, issue #773).
+    const agent = createMockAgent();
+    let releaseIdle!: () => void;
+    const idleGate = new Promise<void>((resolve) => (releaseIdle = resolve));
+    let idleYielded = false;
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield assistantWithSubagentToolUse("toolu_agent-1");
+        yield subagentStarted("agent-1"); // pending → spawnedTaskIds
+        yield taskNotification("agent-1"); // sync subagent done before result
+        yield resultMessage(); // spawnedTaskIds has agent-1 but it's gone; pending empty
+        await idleGate;
+        idleYielded = true;
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "quick sync subagent" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+    // Must NOT have deferred — the sync subagent already settled.
+    expect(idleYielded).toBe(false);
+    releaseIdle();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("parks the turn when task_started never arrives, settling at the next prompt's echo hand-off", async () => {
+    // If task_started is lost entirely (spawn failed before registering, or
+    // the message was dropped), pending keeps the turn held. It must not hang
+    // forever — the next prompt's echo hand-off settles it with its recorded
+    // outcome (the same rescue contract as the other wedge classes).
+    const agent = createMockAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield assistantWithSubagentToolUse("toolu_agent-1");
+        // Result arrives; task_started is never sent. pending holds the turn.
+        yield resultMessage();
+        yield idle(); // hold survives (pending non-empty)
+        // User moves on — the next prompt's echo hand-off settles turn 1.
+        const u2 = await iter.next();
+        yield userEcho(u2.value);
+        yield running();
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "spawn a subagent" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "next prompt" }],
+    });
+
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("clears pending on task_notification when task_started was lost", async () => {
+    // Defense-in-depth: task_notification carries the spawning tool_use_id, so
+    // when task_started was lost but task_notification still arrives, pending
+    // is cleared and the turn settles at the next idle instead of parking.
+    const agent = createMockAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield assistantWithSubagentToolUse("toolu_agent-1");
+        yield resultMessage(); // pending non-empty — defers
+        yield idle(); // hold survives (pending)
+        // task_started LOST — task_notification arrives with tool_use_id.
+        yield taskNotification("agent-1"); // clears pending
+        yield idle(); // nothing pending, nothing spawned — settles here
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
     await agent.sessions["test-session"]?.consumer;
   });
 });

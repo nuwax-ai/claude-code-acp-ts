@@ -362,6 +362,27 @@ type Turn = {
    *  is attributed to the holder — extending that hold behind a foreign
    *  chain. Bounded: the hold still ends at drain, hand-off, or cancel. */
   spawnedTaskIds?: Set<string>;
+  /** tool_use ids of Agent/Task (subagent) calls this turn emitted whose
+   *  `task_started` has not yet arrived — an early signal that a subagent
+   *  spawn is in flight, used to hold settlement open when the terminal
+   *  result races ahead of `task_started` (observed with fast-responding
+   *  models that end_turn immediately after dispatching a background
+   *  subagent). Without it, a result that wins the race settles the turn
+   *  before `task_started` can add the task_id to `spawnedTaskIds`,
+   *  orphaning the subagent: its output, permission requests, and the
+   *  model's followup summary all land outside any turn.
+   *
+   *  Populated when this turn's top-level assistant message's Agent/Task
+   *  tool_use blocks are consumed (always before result — the model emits
+   *  tool_use, then the SDK executes the tool and emits `task_started`,
+   *  then the result). Cleared by `task_started` (which carries the
+   *  matching `tool_use_id`) and, as defense-in-depth, by
+   *  `task_notification`. If neither arrives (the call failed before
+   *  registering a task, or both messages were lost), the id stays and the
+   *  held turn parks until `session/cancel` or the next prompt's echo
+   *  hand-off — the same rescue contract as `deferredSettle`'s Known
+   *  residual #1. */
+  pendingSubagentToolUseIds?: Set<string>;
   /** Set instead of settling when the turn's terminal result arrives while
    *  subagents it spawned are still live (`spawnedTaskIds` ∩
    *  `session.liveBackgroundTasks`). The turn is held open — its
@@ -2334,7 +2355,11 @@ export class ClaudeAcpAgent {
      *  followup-result and idle settle sites, so the two lanes can't drift. */
     const settleDeferredIfDrained = () => {
       const turn = session.activeTurn;
-      if (isHeldOpen(turn) && !turnAwaitingSubagents(turn)) {
+      if (
+        isHeldOpen(turn) &&
+        !turnAwaitingSubagents(turn) &&
+        !turn.pendingSubagentToolUseIds?.size
+      ) {
         settleActive(turn.deferredSettle);
       }
     };
@@ -2357,7 +2382,8 @@ export class ClaudeAcpAgent {
       if (
         session.activeTurn &&
         !session.activeTurn.settled &&
-        turnAwaitingSubagents(session.activeTurn)
+        (turnAwaitingSubagents(session.activeTurn) ||
+          !!session.activeTurn.pendingSubagentToolUseIds?.size)
       ) {
         session.activeTurn.deferredSettle = outcome;
       } else {
@@ -3098,12 +3124,32 @@ export class ClaudeAcpAgent {
                 });
                 if (message.subagent_type && session.activeTurn && !session.activeTurn.settled) {
                   (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);
+                  // The tool_use_id's in-flight tracking is complete: the spawn
+                  // is now tracked by task_id in spawnedTaskIds. This also
+                  // converts a pending-only hold — one held on
+                  // pendingSubagentToolUseIds alone because task_started lost
+                  // the race with the result (see Turn.pendingSubagentToolUseIds)
+                  // — so the drain rule can settle once the subagent finishes.
+                  if (message.tool_use_id) {
+                    session.activeTurn.pendingSubagentToolUseIds?.delete(
+                      message.tool_use_id,
+                    );
+                  }
                 }
                 break;
               case "task_notification":
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 session.liveBackgroundTasks.delete(message.task_id);
+                // Defense-in-depth: task_notification carries the spawning
+                // tool_use_id, so if task_started was lost this clears the
+                // pending entry too — a task_started-less spawn can't park the
+                // turn forever once the task itself has settled.
+                if (message.tool_use_id && session.activeTurn) {
+                  session.activeTurn.pendingSubagentToolUseIds?.delete(
+                    message.tool_use_id,
+                  );
+                }
                 break;
               case "task_updated":
                 // terminal-status task_updated patch and a (deduplicated)
@@ -4010,6 +4056,33 @@ export class ClaudeAcpAgent {
               );
             } else {
               content = message.message.content;
+            }
+
+            // Record Agent/Task tool_use ids as an early "subagent spawn in
+            // flight" signal: a tool_use block always precedes its
+            // task_started and the turn's result in stream order, so this is
+            // the earliest point that can hold settlement when task_started
+            // races past the result (see Turn.pendingSubagentToolUseIds).
+            // Top-level only (parent_tool_use_id === null): a subagent's own
+            // Agent/Task calls must not seed the parent turn's pending set.
+            if (
+              message.type === "assistant" &&
+              message.parent_tool_use_id === null &&
+              !("isReplay" in message && message.isReplay) &&
+              session.activeTurn &&
+              !session.activeTurn.settled
+            ) {
+              for (const item of message.message.content) {
+                if (
+                  (item.type === "tool_use" ||
+                    item.type === "server_tool_use" ||
+                    item.type === "mcp_tool_use") &&
+                  (item.name === "Agent" || item.name === "Task")
+                ) {
+                  (session.activeTurn.pendingSubagentToolUseIds ??=
+                    new Set()).add(item.id);
+                }
+              }
             }
 
             for (const notification of toAcpNotifications(
