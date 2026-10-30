@@ -11,6 +11,10 @@ const mockQuery = vi.hoisted(() =>
     setModel: vi.fn(),
     setPermissionMode: vi.fn(),
     supportedCommands: vi.fn().mockResolvedValue([]),
+    close: vi.fn(),
+    interrupt: vi.fn().mockResolvedValue(undefined),
+    getContextUsage: vi.fn().mockResolvedValue({ totalTokens: 0, rawMaxTokens: 200000 }),
+    [Symbol.asyncIterator]: async function* () {},
   })),
 );
 
@@ -59,7 +63,7 @@ describe("providers", () => {
     expect(response.agentCapabilities?.providers).toEqual({});
   });
 
-  it("lists a single optional 'main' provider, unconfigured by default", async () => {
+  it("lists one mutually exclusive provider slot with native routing", async () => {
     const [agent] = await createAgentMock();
     const response = await agent.unstable_listProviders({});
     expect(response.providers).toEqual([
@@ -67,7 +71,7 @@ describe("providers", () => {
         providerId: "main",
         supported: ["anthropic", "bedrock", "vertex"],
         required: false,
-        current: null,
+        current: { apiType: "anthropic", baseUrl: "https://api.anthropic.com" },
       },
     ]);
   });
@@ -126,7 +130,7 @@ describe("providers", () => {
     ).rejects.toMatchObject({ code: -32602 });
   });
 
-  it("disables the 'main' provider by clearing config and reporting current: null", async () => {
+  it("restores native routing after the last override is disabled", async () => {
     const [agent] = await createAgentMock();
     await agent.unstable_setProvider({
       providerId: "main",
@@ -137,7 +141,36 @@ describe("providers", () => {
 
     await expect(agent.unstable_disableProvider({ providerId: "main" })).resolves.toEqual({});
 
-    expect((await agent.unstable_listProviders({})).providers[0].current).toBeNull();
+    expect((await agent.unstable_listProviders({})).providers[0].current).toEqual({
+      apiType: "anthropic",
+      baseUrl: "https://api.anthropic.com",
+    });
+  });
+
+  it("replaces the active api type when the single slot is set again", async () => {
+    const [agent] = await createAgentMock();
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://anthropic.example",
+    });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "bedrock",
+      baseUrl: "https://bedrock.example",
+    });
+
+    const overridden = await agent.unstable_listProviders({});
+    expect(overridden.providers[0].current).toEqual({
+      apiType: "bedrock",
+      baseUrl: "https://bedrock.example",
+    });
+
+    await agent.unstable_disableProvider({ providerId: "main" });
+    expect((await agent.unstable_listProviders({})).providers[0].current).toEqual({
+      apiType: "anthropic",
+      baseUrl: "https://api.anthropic.com",
+    });
   });
 
   it("treats disabling an unknown provider as an idempotent no-op", async () => {
@@ -161,13 +194,178 @@ describe("providers", () => {
       expect.objectContaining({
         options: expect.objectContaining({
           env: expect.objectContaining({
-            ANTHROPIC_AUTH_TOKEN: " ",
+            ANTHROPIC_AUTH_TOKEN: "acp-proxy",
             ANTHROPIC_BASE_URL: "https://gateway.example",
             ANTHROPIC_CUSTOM_HEADERS: "x-api-key: test",
           }),
         }),
       }),
     );
+  });
+
+  it("keeps native session creation unchanged when the providers API is unused", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(mockQuery).toHaveBeenCalledOnce();
+    expect(mockQuery.mock.calls[0][0].options.resume).toBeUndefined();
+    expect(mockQuery.mock.results[0].value.close).not.toHaveBeenCalled();
+  });
+
+  it("recreates loaded sessions with the new provider between turns", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    const first = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const originalQuery = mockQuery.mock.results[0].value;
+
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example",
+    });
+
+    expect(originalQuery.close).toHaveBeenCalledOnce();
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+    expect(mockQuery.mock.calls[1][0]).toEqual(
+      expect.objectContaining({
+        options: expect.objectContaining({
+          resume: first.sessionId,
+          env: expect.objectContaining({ ANTHROPIC_BASE_URL: "https://gateway.example" }),
+          settings: expect.objectContaining({
+            apiKeyHelper: "",
+            env: expect.objectContaining({
+              ANTHROPIC_BASE_URL: "https://gateway.example",
+              ANTHROPIC_AUTH_TOKEN: "acp-proxy",
+              CLAUDE_CODE_OAUTH_TOKEN: "",
+            }),
+          }),
+        }),
+      }),
+    );
+
+    await agent.unstable_disableProvider({ providerId: "main" });
+
+    expect(mockQuery).toHaveBeenCalledTimes(3);
+    expect(mockQuery.mock.calls[2][0]).toEqual(
+      expect.objectContaining({
+        options: expect.objectContaining({ resume: first.sessionId }),
+      }),
+    );
+    expect(mockQuery.mock.calls[2][0].options.env.ANTHROPIC_BASE_URL).toBe(
+      process.env.ANTHROPIC_BASE_URL,
+    );
+  });
+
+  it("switches every loaded session through proxy replacements and back to native routing", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    const first = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const second = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://first-gateway.example",
+    });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://second-gateway.example",
+    });
+    await agent.unstable_disableProvider({ providerId: "main" });
+
+    expect(mockQuery).toHaveBeenCalledTimes(8);
+    const resumedCalls = mockQuery.mock.calls.slice(2);
+    for (let update = 0; update < 3; update += 1) {
+      expect(
+        resumedCalls.slice(update * 2, update * 2 + 2).map(([request]) => request.options.resume),
+      ).toEqual([first.sessionId, second.sessionId]);
+    }
+    expect(
+      resumedCalls.slice(0, 2).map(([request]) => request.options.env.ANTHROPIC_BASE_URL),
+    ).toEqual(["https://first-gateway.example", "https://first-gateway.example"]);
+    expect(
+      resumedCalls.slice(2, 4).map(([request]) => request.options.env.ANTHROPIC_BASE_URL),
+    ).toEqual(["https://second-gateway.example", "https://second-gateway.example"]);
+    expect(
+      resumedCalls.slice(4).map(([request]) => request.options.env.ANTHROPIC_BASE_URL),
+    ).toEqual([process.env.ANTHROPIC_BASE_URL, process.env.ANTHROPIC_BASE_URL]);
+    for (const result of mockQuery.mock.results.slice(0, 6)) {
+      expect(result.value.close).toHaveBeenCalledOnce();
+    }
+    for (const result of mockQuery.mock.results.slice(6)) {
+      expect(result.value.close).not.toHaveBeenCalled();
+    }
+  });
+
+  it("overrides user routing settings while preserving unrelated settings", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example",
+    });
+
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            settings: {
+              apiKeyHelper: "unsafe-helper",
+              env: {
+                ANTHROPIC_BASE_URL: "https://user-gateway.example",
+                ANTHROPIC_API_KEY: "user-secret",
+                UNRELATED_SETTING: "preserved",
+              },
+              model: "claude-sonnet-4-6",
+            },
+          },
+        },
+      },
+    });
+
+    expect(mockQuery.mock.calls[0][0].options.settings).toEqual(
+      expect.objectContaining({
+        apiKeyHelper: "",
+        model: "claude-sonnet-4-6",
+        env: expect.objectContaining({
+          ANTHROPIC_BASE_URL: "https://gateway.example",
+          ANTHROPIC_API_KEY: "",
+          ANTHROPIC_AUTH_TOKEN: "acp-proxy",
+          UNRELATED_SETTING: "preserved",
+        }),
+      }),
+    );
+  });
+
+  it("waits for an active turn before recreating its session", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    const created = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const originalQuery = mockQuery.mock.results[0].value;
+    let finishTurn!: () => void;
+    const completion = new Promise<void>((resolve) => {
+      finishTurn = resolve;
+    });
+    (agent.sessions[created.sessionId] as any).turnQueue = [{ completion }];
+
+    const update = agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(originalQuery.close).not.toHaveBeenCalled();
+    finishTurn();
+    await update;
+    expect(originalQuery.close).toHaveBeenCalledOnce();
   });
 
   it("routes bedrock provider config into session env", async () => {
@@ -187,7 +385,7 @@ describe("providers", () => {
         options: expect.objectContaining({
           env: expect.objectContaining({
             CLAUDE_CODE_USE_BEDROCK: "1",
-            AWS_BEARER_TOKEN_BEDROCK: " ",
+            AWS_BEARER_TOKEN_BEDROCK: "acp-proxy",
             ANTHROPIC_BEDROCK_BASE_URL: "https://gateway.example",
             ANTHROPIC_CUSTOM_HEADERS: "custom-header: test",
           }),
@@ -225,6 +423,32 @@ describe("providers", () => {
             ANTHROPIC_VERTEX_PROJECT_ID: "my-project",
             CLOUD_ML_REGION: "us-east5",
             ANTHROPIC_CUSTOM_HEADERS: "custom-header: test",
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("leaves the native Vertex base URL unset for the default endpoint", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "vertex",
+      baseUrl: "https://aiplatform.googleapis.com",
+      _meta: { claudeCode: { vertex: { projectId: "my-project", region: "global" } } },
+    });
+
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({
+          env: expect.objectContaining({
+            CLAUDE_CODE_USE_VERTEX: "1",
+            ANTHROPIC_VERTEX_BASE_URL: "",
+            ANTHROPIC_VERTEX_PROJECT_ID: "my-project",
+            CLOUD_ML_REGION: "global",
           }),
         }),
       }),
@@ -298,6 +522,403 @@ describe("providers", () => {
 
     await agent.logout({});
 
-    expect((await agent.unstable_listProviders({})).providers[0].current).toBeNull();
+    expect((await agent.unstable_listProviders({})).providers[0].current).toEqual({
+      apiType: "anthropic",
+      baseUrl: "https://api.anthropic.com",
+    });
+  });
+
+  it("clears a providers/set that is still listing when logout arrives", async () => {
+    const [agent] = await createAgentMock();
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/bin/true");
+    let releaseListing!: () => void;
+    const held = new Promise<void>((resolve) => (releaseListing = resolve));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        await held;
+        return new Response(JSON.stringify({ data: [{ id: "claude-sonnet-5" }] }));
+      }),
+    );
+
+    const set = agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://slow.example",
+    });
+    const logout = agent.logout({});
+    releaseListing();
+    await Promise.all([set, logout]);
+
+    expect((await agent.unstable_listProviders({})).providers[0].current).toEqual({
+      apiType: "anthropic",
+      baseUrl: "https://api.anthropic.com",
+    });
+  });
+
+  it("recreates live sessions without the cleared provider on logout", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/bin/true");
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://provider.example",
+    });
+    const created = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const originalQuery = mockQuery.mock.results[0].value;
+
+    await agent.logout({});
+
+    expect(originalQuery.close).toHaveBeenCalledOnce();
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+    expect(mockQuery.mock.calls[1][0].options.resume).toBe(created.sessionId);
+    expect(mockQuery.mock.calls[1][0].options.env.ANTHROPIC_BASE_URL).toBe(
+      process.env.ANTHROPIC_BASE_URL,
+    );
+  });
+
+  it("leaves live sessions alone on logout without a routing override", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/bin/true");
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const originalQuery = mockQuery.mock.results[0].value;
+
+    await agent.logout({});
+
+    expect(originalQuery.close).not.toHaveBeenCalled();
+    expect(mockQuery).toHaveBeenCalledOnce();
+  });
+
+  describe("gateway model discovery", () => {
+    const GATEWAY_MODELS = [
+      { value: "default", resolvedModel: "claude-opus-5", displayName: "Default", description: "" },
+      { value: "opus", resolvedModel: "claude-opus-5", displayName: "Opus", description: "" },
+      { value: "sonnet", resolvedModel: "claude-sonnet-5", displayName: "Sonnet", description: "" },
+      { value: "haiku", resolvedModel: "claude-haiku-4-5", displayName: "Haiku", description: "" },
+    ];
+
+    function mockQueryWithModels(mockQuery: Mock, models: unknown[] = GATEWAY_MODELS): Mock {
+      const setModel = vi.fn();
+      mockQuery.mockImplementation(() => ({
+        initializationResult: vi.fn().mockResolvedValue({ models }),
+        setModel,
+        setPermissionMode: vi.fn(),
+        supportedCommands: vi.fn().mockResolvedValue([]),
+        close: vi.fn(),
+        interrupt: vi.fn().mockResolvedValue(undefined),
+        getContextUsage: vi.fn().mockResolvedValue({ totalTokens: 0, rawMaxTokens: 200000 }),
+        [Symbol.asyncIterator]: async function* () {},
+      }));
+      return setModel;
+    }
+
+    function stubListing(ids: string[]): Mock {
+      const fetchMock = vi.fn(
+        async () => new Response(JSON.stringify({ data: ids.map((id) => ({ id })) })),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      return fetchMock;
+    }
+
+    function modelOptionValues(response: { configOptions?: any[] | null }): string[] {
+      const option = response.configOptions?.find((o: any) => o.id === "model");
+      return option.options.map((o: any) => o.value);
+    }
+
+    it("offers only the models the gateway lists and switches off a dropped default", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      const setModel = mockQueryWithModels(mockQuery);
+      const fetchMock = stubListing(["claude-sonnet-5-20260101", "claude-haiku-4-5"]);
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example",
+        headers: { authorization: "Bearer real" },
+      });
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(modelOptionValues(response)).toEqual(["sonnet", "haiku"]);
+      expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe(
+        "sonnet",
+      );
+      expect(setModel).toHaveBeenCalledWith("sonnet");
+    });
+
+    it("fails providers/set and keeps the current provider when the listing fails", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      mockQueryWithModels(mockQuery);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => new Response("unavailable", { status: 503 })),
+      );
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+      await expect(
+        agent.unstable_setProvider({
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example",
+        }),
+      ).rejects.toMatchObject({
+        code: -32603,
+        message: expect.stringContaining("Model listing GET /v1/models returned 503: unavailable"),
+      });
+
+      expect((await agent.unstable_listProviders({})).providers[0].current).toEqual({
+        apiType: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+      });
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(modelOptionValues(response)).toEqual(["default", "opus", "sonnet", "haiku"]);
+      expect(mockQuery.mock.calls.at(-1)![0].options.env).not.toHaveProperty(
+        "ANTHROPIC_BASE_URL",
+        "https://gateway.example",
+      );
+    });
+
+    it("lists nothing without providers/set or for a vertex provider", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      mockQueryWithModels(mockQuery);
+      const fetchMock = stubListing(["claude-sonnet-5"]);
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+      const native = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "vertex",
+        baseUrl: "https://vertex.example",
+        _meta: { claudeCode: { vertex: { projectId: "p", region: "europe-west1" } } },
+      });
+      const vertex = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(modelOptionValues(native)).toEqual(["default", "opus", "sonnet", "haiku"]);
+      expect(modelOptionValues(vertex)).toEqual(["default", "opus", "sonnet", "haiku"]);
+    });
+
+    it("narrows a bedrock gateway to the region prefix of its first listed model", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      mockQueryWithModels(mockQuery, [
+        {
+          value: "default",
+          resolvedModel: "eu.anthropic.claude-opus-5",
+          displayName: "Default",
+          description: "",
+        },
+        {
+          value: "sonnet",
+          resolvedModel: "eu.anthropic.claude-sonnet-5",
+          displayName: "Sonnet",
+          description: "",
+        },
+        {
+          value: "haiku",
+          resolvedModel: "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+          displayName: "Haiku",
+          description: "",
+        },
+        {
+          value: "us.anthropic.claude-sonnet-5",
+          displayName: "Sonnet (US)",
+          description: "",
+        },
+      ]);
+      const fetchMock = vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              modelSummaries: [
+                { modelId: "eu.anthropic.claude-sonnet-5" },
+                { modelId: "us.anthropic.claude-opus-5" },
+                { modelId: "us.anthropic.claude-sonnet-5" },
+                { modelId: "eu.anthropic.claude-haiku-4-5-20251001-v1:0" },
+                { modelId: "eu.meta.llama3-3-70b-instruct-v1:0" },
+              ],
+            }),
+          ),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "bedrock",
+        baseUrl: "https://bedrock.example/llm/bedrock",
+        headers: { authorization: "Bearer real" },
+      });
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [URL, { headers: Headers }];
+      expect(url.toString()).toBe("https://bedrock.example/llm/bedrock/foundation-models");
+      expect(init.headers.get("authorization")).toBe("Bearer real");
+      // us.* ids are dropped: opus is listed only under us, and the us
+      // sonnet row would call another region.
+      expect(modelOptionValues(response)).toEqual(["sonnet", "haiku"]);
+      expect(mockQuery).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          options: expect.objectContaining({
+            env: expect.objectContaining({
+              CLAUDE_CODE_USE_BEDROCK: "1",
+              ANTHROPIC_BEDROCK_REGION_PREFIX: "eu",
+            }),
+          }),
+        }),
+      );
+    });
+
+    it("fails providers/set for a bedrock gateway whose listing fails", async () => {
+      const [agent] = await createAgentMock();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          throw new TypeError("fetch failed");
+        }),
+      );
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+      await expect(
+        agent.unstable_setProvider({
+          providerId: "main",
+          apiType: "bedrock",
+          baseUrl: "https://bedrock.example",
+        }),
+      ).rejects.toMatchObject({
+        message: expect.stringContaining(
+          "Model listing GET /foundation-models failed: fetch failed",
+        ),
+      });
+      expect((await agent.unstable_listProviders({})).providers[0].current?.apiType).toBe(
+        "anthropic",
+      );
+    });
+
+    it("offers no model when the listing succeeds but matches none", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      const setModel = mockQueryWithModels(mockQuery);
+      stubListing(["gpt-5"]);
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example",
+      });
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(response.configOptions?.find((o: any) => o.id === "model")).toBeUndefined();
+      expect(setModel).not.toHaveBeenCalled();
+    });
+
+    it("sets a gateway that has no listing and narrows nothing", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      mockQueryWithModels(mockQuery);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => new Response("not found", { status: 404 })),
+      );
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+      await expect(
+        agent.unstable_setProvider({
+          providerId: "main",
+          apiType: "bedrock",
+          baseUrl: "https://bedrock.example",
+        }),
+      ).resolves.toEqual({});
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(modelOptionValues(response)).toEqual(["default", "opus", "sonnet", "haiku"]);
+      expect(mockQuery.mock.calls.at(-1)![0].options.env).not.toHaveProperty(
+        "ANTHROPIC_BEDROCK_REGION_PREFIX",
+      );
+    });
+
+    it("applies providers/set and providers/disable in the order they arrive while a listing runs", async () => {
+      const [agent] = await createAgentMock();
+      let releaseListing!: () => void;
+      const held = new Promise<void>((resolve) => (releaseListing = resolve));
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          await held;
+          return new Response(JSON.stringify({ data: [{ id: "claude-sonnet-5" }] }));
+        }),
+      );
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+      const set = agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://slow.example",
+      });
+      const disable = agent.unstable_disableProvider({ providerId: "main" });
+      releaseListing();
+      await Promise.all([set, disable]);
+
+      expect((await agent.unstable_listProviders({})).providers[0].current).toEqual({
+        apiType: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+      });
+    });
+
+    it("keeps the later providers/set when an earlier one lists slower", async () => {
+      const [agent] = await createAgentMock();
+      let releaseSlow!: () => void;
+      const slow = new Promise<void>((resolve) => (releaseSlow = resolve));
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: URL) => {
+          if (url.hostname === "slow.example") await slow;
+          return new Response(JSON.stringify({ data: [{ id: "claude-sonnet-5" }] }));
+        }),
+      );
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+      const first = agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://slow.example",
+      });
+      const second = agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://fast.example",
+      });
+      releaseSlow();
+      await Promise.all([first, second]);
+
+      expect((await agent.unstable_listProviders({})).providers[0].current?.baseUrl).toBe(
+        "https://fast.example",
+      );
+    });
+
+    it("drops the listing on providers/disable and reuses it when the same gateway is set again", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      mockQueryWithModels(mockQuery);
+      const fetchMock = stubListing(["claude-sonnet-5"]);
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const provider = {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example",
+        headers: { authorization: "Bearer real" },
+      } as const;
+
+      await agent.unstable_setProvider(provider);
+      await agent.unstable_setProvider({ ...provider, headers: { ...provider.headers } });
+      expect(fetchMock).toHaveBeenCalledOnce();
+
+      await agent.unstable_disableProvider({ providerId: "main" });
+      const native = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(modelOptionValues(native)).toEqual(["default", "opus", "sonnet", "haiku"]);
+
+      await agent.unstable_setProvider(provider);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
   });
 });

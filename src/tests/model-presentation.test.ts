@@ -1,0 +1,331 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { query, type ModelInfo, type Query } from "@anthropic-ai/claude-agent-sdk";
+import {
+  applyAvailableModelsAllowlist,
+  buildModelConfigOption,
+  getAvailableModels,
+} from "../session-model.js";
+
+const OPUS: ModelInfo = {
+  value: "opus[1m]",
+  resolvedModel: "claude-opus-5[1m]",
+  displayName: "Opus (1M context)",
+  description: "Opus 5 with 1M context · Best for everyday, complex tasks",
+};
+
+describe("versioned model display names", () => {
+  beforeEach(() => vi.stubEnv("ANTHROPIC_MODEL", undefined));
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("adds standard-family versions and preserves model identity and recommendation", async () => {
+    const models: ModelInfo[] = [
+      { ...OPUS, value: "default", displayName: "Default (recommended)" },
+      OPUS,
+      { value: "sonnet[1m]", displayName: "Sonnet 5 (1M context)", description: "" },
+      { value: "custom", displayName: "Custom Opus (1M context)", description: "" },
+    ];
+    const setModel = vi.fn();
+    const state = await getAvailableModels(
+      { setModel } as unknown as Query,
+      models,
+      models,
+      { getSettings: () => ({}) },
+      { log: vi.fn(), error: vi.fn() },
+      false,
+      "model-presentation-test",
+    );
+
+    expect(state.availableModels).toEqual(
+      models.map((model) => ({
+        modelId: model.value,
+        name: model === OPUS ? "Opus 5" : model.displayName,
+        description: model.description,
+      })),
+    );
+    expect(buildModelConfigOption(state, models, true)).toMatchObject({
+      currentValue: "opus[1m]",
+      _meta: { jetbrains: { air: { recommendedValue: "opus[1m]" } } },
+      options: expect.arrayContaining([
+        { value: "opus[1m]", name: "Opus 5", description: OPUS.description },
+      ]),
+    });
+    expect(OPUS.displayName).toBe("Opus (1M context)");
+    expect(setModel).not.toHaveBeenCalled();
+  });
+
+  it("adds major and minor versions without changing custom or already-versioned names", async () => {
+    const models: ModelInfo[] = [
+      {
+        value: "sonnet",
+        resolvedModel: "claude-sonnet-5",
+        displayName: "Sonnet",
+        description: "Sonnet 5 · Efficient for routine tasks",
+      },
+      {
+        value: "haiku",
+        resolvedModel: "claude-haiku-4-5-20251001",
+        displayName: "Claude Haiku",
+        description: "Fast",
+      },
+      {
+        value: "fable",
+        resolvedModel: "claude-fable-5-1",
+        displayName: "Fable",
+        description: "Fable 5.1 · Creative model",
+      },
+      {
+        value: "opus[1m]",
+        resolvedModel: "claude-opus-5[1m]",
+        displayName: "Opus 5 (1M context)",
+        description: "",
+      },
+      { value: "custom", displayName: "My Sonnet", description: "" },
+      { value: "future", displayName: "Haiku (1M context)", description: "" },
+      { value: "custom-versioned", displayName: "Fable 5.1 (1M context)", description: "" },
+    ];
+    const state = await getAvailableModels(
+      {} as Query,
+      models,
+      models,
+      { getSettings: () => ({}) },
+      { log: vi.fn(), error: vi.fn() },
+      false,
+      "model-presentation-test",
+    );
+
+    expect(state.availableModels.map((model) => model.name)).toEqual([
+      "Sonnet 5",
+      "Claude Haiku 4.5",
+      "Fable 5.1",
+      "Opus 5 (1M context)",
+      "My Sonnet",
+      "Haiku (1M context)",
+      "Fable 5.1 (1M context)",
+    ]);
+  });
+
+  it("only moves the context hint out of the name when the description retains it", async () => {
+    const models: ModelInfo[] = [
+      {
+        value: "opus-described[1m]",
+        resolvedModel: "claude-opus-5[1m]",
+        displayName: "Opus 5 (1M context)",
+        description: "Opus 5 with 1M context",
+      },
+      {
+        value: "opus-undescribed[1m]",
+        resolvedModel: "claude-opus-5[1m]",
+        displayName: "Opus 5 (1M context)",
+        description: "",
+      },
+      {
+        value: "fable-undescribed[1m]",
+        resolvedModel: "claude-fable-5-1[1m]",
+        displayName: "Fable (1M context)",
+        description: "",
+      },
+    ];
+    const state = await getAvailableModels(
+      {} as Query,
+      models,
+      models,
+      { getSettings: () => ({}) },
+      { log: vi.fn(), error: vi.fn() },
+      false,
+      "model-presentation-test",
+    );
+
+    expect(state.availableModels.map((model) => model.name)).toEqual([
+      "Opus 5",
+      "Opus 5 (1M context)",
+      "Fable 5.1 (1M context)",
+    ]);
+  });
+
+  it("keeps the suffix if another selectable model is already named Opus", async () => {
+    const models = [OPUS, { ...OPUS, value: "opus", displayName: "Opus" }];
+    const state = await getAvailableModels(
+      {} as Query,
+      models,
+      models,
+      { getSettings: () => ({}) },
+      { log: vi.fn(), error: vi.fn() },
+      false,
+      "model-presentation-test",
+    );
+    expect(state.availableModels.map((model) => model.name)).toEqual(["Opus (1M context)", "Opus"]);
+  });
+
+  it("distinguishes allowlisted aliases and pins that inherit the same SDK label", async () => {
+    const sdkModels: ModelInfo[] = [
+      { value: "default", displayName: "Default (recommended)", description: "" },
+      {
+        value: "opus",
+        resolvedModel: "claude-opus-5-5",
+        displayName: "Opus 5.5",
+        description: "For complex work and everyday tasks",
+      },
+      { value: "haiku", displayName: "Haiku", description: "Fast" },
+    ];
+    const ids = ["claude-opus-5-5[1m]", "claude-opus-5-5", "opus[1m]", "opus", "haiku"];
+    const models = applyAvailableModelsAllowlist(sdkModels, ids);
+    const setModel = vi.fn();
+    const state = await getAvailableModels(
+      { setModel } as unknown as Query,
+      models,
+      sdkModels,
+      { getSettings: () => ({}) },
+      { log: vi.fn(), error: vi.fn() },
+      false,
+      "model-presentation-test",
+    );
+
+    const expected = [
+      "Default (recommended)",
+      ...ids.slice(0, 4).map((id) => `Opus 5.5 (${id})`),
+      "Haiku",
+    ];
+    expect(state.availableModels.map((model) => model.name)).toEqual(expected);
+    expect(state.availableModels.map((model) => model.modelId)).toEqual(["default", ...ids]);
+    expect(state.currentModelId).toBe("default");
+    expect(state.availableModels.slice(1, 5).map((model) => model.description)).toEqual(
+      Array(4).fill(sdkModels[1].description),
+    );
+    const option = buildModelConfigOption(state, models, false);
+    expect(option).toMatchObject({ currentValue: "default" });
+    expect(option.type === "select" && option.options.map((model) => model.name)).toEqual(expected);
+    expect(sdkModels[1].displayName).toBe("Opus 5.5");
+    expect(setModel).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes identical custom labels without changing their model IDs", async () => {
+    const models: ModelInfo[] = [
+      { value: "provider-a", displayName: "My model", description: "First endpoint" },
+      { value: "provider-b", displayName: "My model", description: "Second endpoint" },
+    ];
+    const state = await getAvailableModels(
+      {} as Query,
+      models,
+      models,
+      { getSettings: () => ({}) },
+      { log: vi.fn(), error: vi.fn() },
+      false,
+      "model-presentation-test",
+    );
+    expect(state.availableModels).toEqual([
+      { modelId: "provider-a", name: "My model (provider-a)", description: "First endpoint" },
+      { modelId: "provider-b", name: "My model (provider-b)", description: "Second endpoint" },
+    ]);
+  });
+});
+
+describe("model option currentValue is one of its options", () => {
+  const DEFAULT: ModelInfo = { ...OPUS, value: "default", displayName: "Default (recommended)" };
+  const SONNET: ModelInfo = {
+    value: "sonnet",
+    resolvedModel: "claude-sonnet-5",
+    displayName: "Sonnet 5",
+    description: "Sonnet",
+  };
+  const listed = [DEFAULT, OPUS, SONNET];
+  const availableModels = listed.map((model) => ({
+    modelId: model.value,
+    name: model.displayName,
+    description: model.description,
+  }));
+  const values = (option: ReturnType<typeof buildModelConfigOption>) =>
+    option.type === "select"
+      ? option.options.map((entry) => ("value" in entry ? entry.value : entry.group))
+      : [];
+
+  it("lists an off-list current model after the listed models", () => {
+    const offList: ModelInfo = {
+      value: "claude-opus-4-1",
+      displayName: "claude-opus-4-1",
+      description: "",
+    };
+    for (const useRecommendedValue of [false, true]) {
+      const option = buildModelConfigOption(
+        { availableModels, currentModelId: offList.value },
+        [...listed, offList],
+        useRecommendedValue,
+      );
+      expect(option.currentValue).toBe("claude-opus-4-1");
+      expect(option.type === "select" && option.options.at(-1)).toEqual({
+        value: "claude-opus-4-1",
+        name: "claude-opus-4-1",
+        description: undefined,
+      });
+    }
+  });
+
+  it("names an off-list current model with no model info by its id", () => {
+    const option = buildModelConfigOption(
+      { availableModels, currentModelId: "claude-haiku-9" },
+      listed,
+      false,
+    );
+    expect(option.currentValue).toBe("claude-haiku-9");
+    expect(values(option)).toEqual(["default", "opus[1m]", "sonnet", "claude-haiku-9"]);
+  });
+
+  it("adds no entry while the current model is listed", () => {
+    const option = buildModelConfigOption(
+      { availableModels, currentModelId: "sonnet" },
+      listed,
+      false,
+    );
+    expect(values(option)).toEqual(["default", "opus[1m]", "sonnet"]);
+  });
+
+  it("maps a current default onto the listed recommended model", () => {
+    const option = buildModelConfigOption(
+      { availableModels, currentModelId: "default" },
+      listed,
+      true,
+    );
+    expect(option.currentValue).toBe("opus[1m]");
+    expect(values(option)).toEqual(["opus[1m]", "sonnet"]);
+  });
+});
+
+// Account-dependent model availability requires the same authenticated environment
+// as the adapter. No prompt is sent: inspect only the SDK initialization response.
+it.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
+  "the real SDK exposes one plain Opus row",
+  async () => {
+    let finishInput!: () => void;
+    const inputGate = new Promise<void>((resolve) => {
+      finishInput = resolve;
+    });
+    // Keep stdin open for initialization without ever submitting a prompt.
+    // eslint-disable-next-line require-yield
+    async function* input() {
+      await inputGate;
+    }
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), 25000);
+    const q = query({ prompt: input(), options: { persistSession: false, abortController } });
+    try {
+      const { models } = await q.initializationResult();
+      // Only alias rows ("opus", "opus[1m]"). The catalogue also lists pinned
+      // older versions such as "claude-opus-4-8"; those are separate models.
+      const opusModels = models.filter((model) => /^opus\b/i.test(model.value));
+      expect(opusModels).toHaveLength(1);
+      // CLI 2.1.283 dropped the "[1m]" / "(1M context)" spelling from the Opus
+      // row: Opus is natively 1M, so the row names the plain model.
+      expect(opusModels[0]).toMatchObject({
+        value: "opus",
+        displayName: expect.stringMatching(/^Opus\b/),
+        resolvedModel: expect.stringMatching(/^claude-opus-[\d-]+$/),
+      });
+      expect(opusModels[0].displayName).not.toMatch(/\b1m\b/i);
+      expect(opusModels[0].description).not.toMatch(/\b1m\b/i);
+    } finally {
+      clearTimeout(timeout);
+      finishInput();
+      q.close();
+    }
+  },
+  30000,
+);

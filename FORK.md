@@ -1,7 +1,7 @@
 # FORK.md — Fork 项目改动记录
 
 > 记录本仓库(nuwax-ai/claude-code-acp-ts)相对于官方上游 `main` 分支的全部自定义改动。
-> 最后更新:2026-10-30,基于 merge-base `bba9127`。
+> 最后更新:2026-10-31(已合并上游 main @ `eb78afa`,合并取舍见第 6 节)。
 
 ## 1. 项目定位
 
@@ -23,16 +23,23 @@
 
 以下改动按提交时间倒序排列,均为 fork 独有、上游没有的内容。
 
-### 3.1 turn settlement 竞态修复(`6abd56c`,2026-08-06)
+### 3.1 turn settlement 竞态修复(`6abd56c`,2026-08-06)— **已于 2026-10-31 合并时移除**
 
 **问题**:后台 subagent 调度后,快响应模型可能立即 end_turn,终端 `result` 先于
 `task_started` 到达。此时 `spawnedTaskIds` 还是空的,`turnAwaitingSubagents` 返回
 false,turn 提前 settle,导致 subagent 被孤立——其流式输出、权限请求和模型的后续
 总结全部落在 turn 之外(上游 issues #864/#866)。
 
-**实现**:新增 `Turn.pendingSubagentToolUseIds`(src/acp-agent.ts:385),在 result
-先到、`task_started` 未到时,以 tool_use_id 为 key 保持 turn 打开;`task_started`
-到达后转换为按 `task_id` 跟踪(`spawnedTaskIds`),并清掉对应的 pending 条目。
+**当初实现**:新增 `Turn.pendingSubagentToolUseIds`,在 assistant 消息消费时播种
+Agent/Task tool_use id,由 task_started/task_notification 清理。
+
+**移除原因**:上游 main 的 subagent 体系已彻底重写(spawnedTaskIds hold +
+`background_tasks_changed` 丢失 bookend 对账 + 顺序流消费),正是对"主 agent 等
+subagent 卡死"问题的上游根治方案。fork 的播种机制与 main 的 native/RFD subagent
+路径(不发 task_started)冲突,会引入新的挂起类。按"官方彻底解决则用官方"的原则
+整体移除,adopted main 的 settlement 体系。
+**遗留观察项**:若生产中再次出现 result 先于 task_started 的孤立症状,需要先在
+当前 CLI/SDK 上取证,再考虑向上游提 issue 而非重新打补丁。
 
 ### 3.2 强制禁用 dataviz skill(`d3a8c57`,2026-07-29)
 
@@ -40,15 +47,15 @@ false,turn 提前 settle,导致 subagent 被孤立——其流式输出、权限
 - 通过 `disallowedTools` 追加 `Skill(dataviz)` + 注入 `skillOverrides: "off"`
   双重封禁:对模型不可见,且不可调用。
 
-### 3.3 compaction 以 tool_call 生命周期呈现(`9f986a8`,2026-07-25)
+### 3.3 compaction 以 tool_call 生命周期呈现(`9f986a8`,2026-07-25)— **已于 2026-10-31 合并时移除**
 
-- 新增 `compactionToolCallId` 状态机(src/acp-agent.ts:2087 起):
-  `compacting` → 发出 `tool_call`(in_progress,同时置
-  `session.emittedAssistantText = true`,防止 `/compact` 场景下结果文本被
-  issue-#453 fallback 重复转发);`compact_result` → `tool_call_update`(completed/failed)。
-- 背景:SDK 对失败的 compaction 会发两次不可区分的终态消息,用 in-progress
-  标记去重,第二次终态为 no-op。
-- 客户端视角:压缩不再是穿插在助手文本里的 prose,而是离散的、有状态的工具调用。
+**当初实现**:手工 `compactionToolCallId` 状态机,把压缩呈现为离散 tool_call。
+
+**移除原因**:上游 main 新增 `ContextCompactionLifecycle`(src/context-compaction.ts),
+其默认呈现方式就是 `tool_call`("Compact conversation" 工具调用),且额外覆盖了
+fork 版本的两个关注点:`consumeDuplicateErrorOutput`(失败压缩的重复终态去重)和
+`hasDeliveredOutput`(仅压缩的 turn 不重发结果文本,issue-#453)。fork 实现被
+上游原生方案完全取代。
 
 ### 3.4 默认禁用交互型/联网工具(`5b92598`,2026-06-12;更早见 `9e13999`/`087282e`)
 
@@ -106,42 +113,35 @@ fork 的发布模式与上游完全不同,**合并时这一块必须整块保留
 - 定期的依赖升级与 lockfile 同步(`2c5bc39`、`c44f3dd` 等)。
 - 版本号 bump 系列提交(0.38.x → 0.62.x → 0.65.0)。
 
-## 6. 合并上游 main 的冲突分析(2026-10-30 模拟)
+## 6. 2026-10-31 合并上游 main 的记录(merge-base `bba9127` → `eb78afa`,288 个上游提交)
 
-用 `git merge-tree --write-tree HEAD origin/main` 模拟,结果:
+**合并策略与结果:**
 
-**冲突文件 4 个,共 15 个冲突块;README.md、package.json 可自动合并。**
+| 冲突/语义项 | 取舍 |
+|------|------|
+| `publish.yml`(2 块) | 整块保留 fork 的 tag 触发 + tag 取版本方案 |
+| `create-session-options.test.ts`(1 块) | 双方属性都保留(`skillOverrides.dataviz` + `availableModels`) |
+| compaction 实现(acp-agent.ts) | 整体采用 main 的 `ContextCompactionLifecycle`(见 3.3) |
+| settlement 竞态补丁(acp-agent.ts) | 整体移除 fork 的 pending 机制(见 3.1) |
+| `AskUserQuestion` 相关 main 新测试 | 改写为 fork 语义(无条件禁用,onElicitation 仍接线) |
+| 场景 golden 快照(46 个) | 不改快照;在场景 harness 的 `normalize` 中把 fork 包名归一化为上游名,快照与上游保持字节一致,后续合并零冲突 |
+| CLAUDE_MODEL_CONFIG 合并测试(3 个) | 期望值补充 `skillOverrides: { dataviz: "off" }` |
 
-| 文件 | 冲突块 | 冲突内容 |
-|------|--------|----------|
-| `.github/workflows/publish.yml` | 2 | 触发方式(tag vs push main)、setup-node 版本。→ 保留 fork 的 tag 方案 |
-| `src/acp-agent.ts` | 5 | ① compactionToolCallId 声明与清理;② turn settle 逻辑(isHeldOpen / pendingSubagentToolUseIds / deferredSettle);③ compaction tool_call 发送;④ subagent task_started 追踪 |
-| `src/tests/acp-agent.test.ts` | 7 | compaction 断言(tool_call vs message_chunk)、subagent settlement 测试用例 |
-| `src/tests/create-session-options.test.ts` | 1 | 轻微,dataviz 相关断言 |
-
-**结论:机械冲突少,语义冲突重。** 上游 main 在冲突区域做了大规模重构
-(新增 `acp-subagents.ts`、`native-subagents.ts`、`async-tasks.ts`、
-`context-compaction.ts` 等,acp-agent.ts 体量翻倍),合并前需逐项判断:
-
-1. **settlement 竞态修复(3.1)**:上游新 subagent 体系可能已原生解决同样的
-   task_started 竞态 —— 若已修,fork 补丁应丢弃而非保留,需对照
-   `acp-subagents.ts` / `async-tasks.ts` 验证。
-2. **compaction tool_call(3.3)**:上游新增 `context-compaction.ts` /
-   `context-compaction-meta.ts`,方向可能已收敛,应与上游实现对齐而非硬保
-   fork 版本。
-3. **禁用工具/skill(3.2/3.4)**:需确认在上游新的 `permissions/` 体系下
-   的挂载方式。
-4. **CI(第 4 节)**:整块保留 fork 版本,不做取舍。
+**验证:**构建通过、lint 通过;vitest 全量 3510 通过 / 9 失败,失败清单与纯
+上游 main 基线逐条一致(均为依赖真实 Claude CLI 的环境型失败:providers ×7、
+session-hooks ×2),合并未引入任何新失败。fork 的 5 个竞态回归测试随机制一并移除。
 
 ## 7. 同步上游的操作建议
 
 ```bash
 git fetch origin main
-git merge origin/main   # 或 rebase,视团队习惯;历史上一直用 merge
+git merge origin/main   # 历史上一直用 merge
 ```
 
-- 解决顺序建议:先 publish.yml(整块取 fork)→ create-session-options.test.ts
-  → acp-agent.ts(按第 6 节逐块判断)→ acp-agent.test.ts(跟随实现调整断言)。
-- 合并后必跑:`npm run build && npm run test:run`(本地 vitest 单测)。
-- 三个"待判断"项(第 6 节 1–3)建议在合并前先读上游对应新文件,决定
-  保留 / 对齐 / 丢弃,避免把上游已修复的问题又改回 fork 的旧方案。
+- 解决顺序建议:先 publish.yml(整块取 fork)→ acp-agent.ts(compaction/
+  settlement 预期取 main,只保留禁用工具/skill 注入)→ 测试文件跟随实现。
+- 场景 golden 快照永远不要用 `-u` 重新生成:包名差异由 harness 的 normalize
+  承接,快照保持与上游一致。
+- 合并后必跑:`npm run build && npm run lint && npm run test:run`,并与"纯上游
+  基线"(在临时 worktree 检出 origin/main 跑同一套测试)对比失败清单,只允许
+  环境型失败存在。

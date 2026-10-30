@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 
-import { resolveSettings } from "@anthropic-ai/claude-agent-sdk";
-import { claudeCliPath, runAcp } from "./acp-agent.js";
+import { claudeCliPath } from "./acp-agent.js";
+import { applyManagedPolicyEnv } from "./managed-policy.js";
+import { acpProtocolsFromEnv, serveAcp } from "./serve.js";
 import packageJson from "../package.json" with { type: "json" };
+import { appendFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 
 // `--cli` is checked first so that `--version`/`-v` (and any other flags) are
 // forwarded to the wrapped native CLI rather than swallowed by our own version
@@ -42,13 +45,10 @@ if (process.argv.includes("--cli")) {
   process.exit(0);
 } else {
   // Apply env vars from the managed-policy tier before any SDK call so the
-  // SDK subprocess inherits them. Going through resolveSettings (vs. a raw
-  // read of managed-settings.json) also picks up MDM sources on macOS and
-  // HKLM/HKCU on Windows.
-  const policy = await resolveSettings({ settingSources: [] });
-  for (const [key, value] of Object.entries(policy.effective.env ?? {})) {
-    process.env[key] = value;
-  }
+  // SDK subprocess inherits them. Reading the tier is best-effort: a transient
+  // failure leaves the agent running with no policy env instead of aborting
+  // module evaluation here, before any ACP traffic.
+  await applyManagedPolicyEnv();
 
   // stdout is used to send messages to the client
   // we redirect everything else to stderr to make sure it doesn't interfere with ACP
@@ -61,10 +61,34 @@ if (process.argv.includes("--cli")) {
     console.error("Unhandled Rejection at:", promise, "reason:", reason);
   });
 
-  const { connection, agent } = runAcp();
+  const logDirectory = process.env.CLAUDE_AGENT_LOGS;
+  const logger = logDirectory
+    ? (() => {
+        mkdirSync(logDirectory, { recursive: true });
+        const logFile = join(logDirectory, "agent.log");
+        const writeLog = (...args: unknown[]) => {
+          const rendered = args
+            .map((arg) => (arg instanceof Error ? (arg.stack ?? arg.message) : String(arg)))
+            .join(" ");
+          appendFileSync(logFile, `${new Date().toISOString()} pid=${process.pid} ${rendered}\n`);
+        };
+        return {
+          log: writeLog,
+          error: (...args: unknown[]) => {
+            console.error(...args);
+            writeLog(...args);
+          },
+        };
+      })()
+    : undefined;
+  logger?.log("Claude ACP started");
+
+  const acp = serveAcp(logger, {
+    protocols: acpProtocolsFromEnv(process.env.CLAUDE_AGENT_ACP_PROTOCOL),
+  });
 
   async function shutdown() {
-    await agent.dispose().catch((err) => {
+    await acp.dispose().catch((err) => {
       console.error("Error during cleanup:", err);
     });
     process.exit(0);
@@ -73,7 +97,7 @@ if (process.argv.includes("--cli")) {
   // Exit cleanly when the ACP connection closes (e.g. stdin EOF, transport
   // error). Without this, `process.stdin.resume()` keeps the event loop
   // alive indefinitely, causing orphan process accumulation in oneshot mode.
-  connection.closed.then(shutdown);
+  acp.closed.then(shutdown);
 
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);

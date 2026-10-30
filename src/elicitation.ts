@@ -1,17 +1,21 @@
 import { randomUUID } from "node:crypto";
-import { CreateElicitationResponse } from "@agentclientprotocol/sdk";
 import type {
   CreateElicitationRequest,
-  ElicitationAcceptAction,
+  CreateElicitationResponse,
   ElicitationPropertySchema,
   ElicitationSchema,
   EnumOption,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { ElicitationRequest, ElicitationResult } from "@anthropic-ai/claude-agent-sdk";
 import type {
   AskUserQuestionInput,
   AskUserQuestionOutput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
+import {
+  AIR_CUSTOM_ANSWER_KEY,
+  LEGACY_AIR_CUSTOM_ANSWER_KEY,
+  withAirMeta,
+} from "./air-extension.js";
 
 /**
  * Bridges between the Claude Agent SDK's elicitation/dialog callbacks and ACP's
@@ -70,17 +74,22 @@ export function mcpElicitationToCreateRequest(
 }
 
 /**
- * Content of an accepted elicitation response.
+ * Content of an accepted elicitation response, or `{}` when the response is
+ * no accept or its `content` is no JSON object.
  *
- * Uses the SDK's validating guard rather than an `action === "accept"` check:
- * the guard both narrows past the union's custom/future variant and validates
- * the payload, so a malformed accept (right tag, ill-typed content) yields
- * empty content — the same classification the SDK's wire validators apply.
+ * The values are not checked. v1 allows a string, number, boolean, or string
+ * array; v2 also allows any other JSON value, such as an object. An MCP
+ * server checks the content against its own `requestedSchema`, so it gets the
+ * content as the client sent it: before, an accept whose content held an
+ * object reached the server as `{ action: "accept", content: {} }`. Callers
+ * that read a field must check its type.
  */
-function acceptedElicitationContent(
-  response: CreateElicitationResponse,
-): NonNullable<ElicitationAcceptAction["content"]> {
-  return CreateElicitationResponse.isAccept(response) ? (response.content ?? {}) : {};
+function acceptedElicitationContent(response: CreateElicitationResponse): Record<string, unknown> {
+  if (response.action !== "accept") return {};
+  const content: unknown = (response as { content?: unknown }).content;
+  return content !== null && typeof content === "object" && !Array.isArray(content)
+    ? (content as Record<string, unknown>)
+    : {};
 }
 
 /**
@@ -92,7 +101,11 @@ export function createElicitationResponseToElicitResult(
 ): ElicitationResult {
   switch (response.action) {
     case "accept":
-      return { action: "accept", content: acceptedElicitationContent(response) };
+      // `ElicitResult` types the values as v1 does. The MCP server checks them.
+      return {
+        action: "accept",
+        content: acceptedElicitationContent(response) as ElicitationResult["content"],
+      };
     case "decline":
       return { action: "decline" };
     case "cancel":
@@ -149,14 +162,6 @@ function questionCustomFieldKey(index: number): string {
 const OPTION_META_KEY = "_claude/askUserQuestionOption";
 
 /**
- * Shared `_meta` key for marking a per-question free-text field as the custom
- * answer companion for a select question. This intentionally has no
- * agent-specific namespace so ACP clients can recognize the same marker across
- * Codex, Claude, and other AskUserQuestion bridges.
- */
-const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
-
-/**
  * Render the AskUserQuestion tool's questions as an ACP form elicitation.
  *
  * Fields are keyed by a short stable id (`question_<n>`) rather than the full
@@ -168,14 +173,17 @@ const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
  *
  * Each question is followed by its own optional free-text "custom answer" field
  * (`question_<n>_custom`), mirroring the CLI's per-question "Other" box: the
- * user can type their own answer instead of picking an option, scoped to that
- * specific question. Nothing is marked required, so the user can also just skip
- * — matching the built-in tool, which always offers Skip + a free-text box.
+ * user can type their own answer instead of picking an option, add it to a
+ * multi-select's picks, or attach it as a note to a single-select's pick (see
+ * `applyAskElicitationResponse`), scoped to that specific question. Nothing is
+ * marked required, so the user can also just skip — matching the built-in tool,
+ * which always offers Skip + a free-text box.
  */
 export function askUserQuestionsToCreateRequest(
   questions: AskUserQuestion[],
   sessionId: string,
   toolCallId: string | undefined,
+  airClient = false,
 ): CreateElicitationRequest {
   const single = questions.length === 1;
   const properties: Record<string, ElicitationPropertySchema> = {};
@@ -208,16 +216,25 @@ export function askUserQuestionsToCreateRequest(
       ? { type: "array", title, description, items: { anyOf: options } }
       : { type: "string", title, description, oneOf: options };
 
+    const customAnswer = { questionId: questionFieldKey(index), isCustomAnswer: true };
     properties[questionCustomFieldKey(index)] = {
       type: "string",
       title: "Other",
-      description: "Type your own answer instead of choosing an option above (optional).",
-      _meta: {
-        [CUSTOM_ANSWER_META_KEY]: {
-          questionId: questionFieldKey(index),
-          isCustomAnswer: true,
-        },
-      },
+      description: question.multiSelect
+        ? "Type your own answer to add to your selection above (optional)."
+        : "Type your own answer, or add a note to the option you chose above (optional).",
+      // Marks the field as the custom answer companion of a select question,
+      // under `_meta.jetbrains.air.customAnswer` and under the root key that
+      // released AIR versions read. Only AIR gets the marker.
+      ...(airClient
+        ? {
+            _meta: withAirMeta(
+              { [LEGACY_AIR_CUSTOM_ANSWER_KEY]: customAnswer },
+              AIR_CUSTOM_ANSWER_KEY,
+              customAnswer,
+            ),
+          }
+        : {}),
     };
   });
 
@@ -242,24 +259,66 @@ export type AskUserQuestionOutcome =
   { action: "answered"; updatedInput: Record<string, unknown> } | { action: "cancel" };
 
 /**
+ * Serialize a multi-select answer the way the CLI's own AskUserQuestion UI
+ * does: comma-joined, with any item that itself contains the separator (or a
+ * double quote) JSON-quoted. The tool's `call()` splits the string back on the
+ * same rule, so a free-text answer like `Redis, not Memcached` stays one item
+ * instead of reading as two more picks.
+ */
+function joinMultiSelectAnswer(items: string[]): string {
+  return items
+    .map((item) => (item.includes(", ") || item.includes('"') ? JSON.stringify(item) : item))
+    .join(", ");
+}
+
+/**
  * Fold an ACP elicitation response into the AskUserQuestion tool's input.
  *
  * Selected labels are read back from the indexed form fields and written into
- * `answers` as a `{ [questionText]: label }` map (comma-joining multi-selects)
- * — the key shape the tool's own `call()` reads. A non-empty per-question
- * custom-answer field (`question_<n>_custom`) takes precedence over that
- * question's selection, since the user typed their own answer instead of
- * picking one. Decline yields empty answers (the model is told the user skipped
- * rather than the turn aborting); cancel — and any custom/future action we
- * don't understand — aborts the tool call.
+ * `answers` as a `{ [questionText]: label }` map — the key shape the tool's own
+ * `call()` reads — with multi-selects comma-joined in the CLI's own quoted form
+ * (see `joinMultiSelectAnswer`). A non-empty per-question custom-answer field
+ * (`question_<n>_custom`) joins the selection of a multi-select question, where
+ * the two fields are independent and filling both means both. For a
+ * single-select question it is the answer when nothing was picked (the user
+ * typed their own instead), and otherwise travels beside the pick as the
+ * tool's own per-question `annotations[question].notes` — the slot the CLI
+ * uses for free text attached to a selection and renders to the model as
+ * `"Q"="A" notes: ...` — so a client that presents the box as a notes field
+ * cannot make the selection disappear. Decline yields empty answers (the model
+ * is told the user skipped rather than the turn aborting); cancel — and any
+ * custom/future action we don't understand — aborts the tool call.
+ *
+ * With `reportUnanswered` set (the session's `system/init` listed
+ * `ask_user_question_unanswered_v1`), each question left without an answer
+ * also gets `annotations[question].unanswered`: `"dismissed"` for every
+ * question when the user declined the form, `"skipped"` for a question left
+ * blank in an accepted form. The model does not see this field; the tool
+ * result carries it for clients and transcripts. A CLI without the capability
+ * can refuse the whole answer over it, so it is left out there.
  */
 export function applyAskElicitationResponse(
   response: CreateElicitationResponse,
   toolInput: Record<string, unknown>,
   questions: AskUserQuestion[],
+  options: { reportUnanswered?: boolean } = {},
 ): AskUserQuestionOutcome {
+  // Typed against the output schema: as of SDK 0.3.312 only it lists
+  // `unanswered`, though the tool reads the same annotations from its input.
+  const annotations: NonNullable<AskUserQuestionOutput["annotations"]> = {};
+  const withAnnotations = (answers: AskUserQuestionOutput["answers"]) => ({
+    ...toolInput,
+    answers,
+    ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
+  });
+
   if (response.action === "decline") {
-    return { action: "answered", updatedInput: { ...toolInput, answers: {} } };
+    if (options.reportUnanswered) {
+      for (const question of questions) {
+        annotations[question.question] = { unanswered: "dismissed" };
+      }
+    }
+    return { action: "answered", updatedInput: withAnnotations({}) };
   }
 
   if (response.action !== "accept") {
@@ -271,32 +330,68 @@ export function applyAskElicitationResponse(
   // stay in sync with what the built-in tool's call() expects to read back.
   const answers: AskUserQuestionOutput["answers"] = {};
   questions.forEach((question, index) => {
-    // A typed custom answer wins over the selection: the user chose to write
-    // their own answer for this question instead of picking an option.
     const custom = content[questionCustomFieldKey(index)];
-    if (typeof custom === "string" && custom.trim() !== "") {
-      answers[question.question] = custom.trim();
+    const customText = typeof custom === "string" ? custom.trim() : "";
+
+    // A pick is a string, number, or boolean. Other values, such as an object
+    // that a v2 client may send, are dropped instead of read as "[object Object]".
+    const value = content[questionFieldKey(index)];
+    const picks: string[] = (Array.isArray(value) ? value : [value])
+      .filter(isElicitationScalar)
+      .map(String)
+      .filter((item) => item !== "");
+
+    // A multi-select is additive, and the form offers the selection and the
+    // custom box as independent fields — a user who fills both means both, so
+    // the typed answer joins the checked options.
+    if (question.multiSelect) {
+      const text = joinMultiSelectAnswer(customText === "" ? picks : [...picks, customText]);
+      if (text !== "") {
+        answers[question.question] = text;
+      }
       return;
     }
 
-    const value = content[questionFieldKey(index)];
-    if (value === undefined || value === null) {
+    // A single-select question is answered by exactly one thing. With no option
+    // picked, the typed text is that answer (the CLI's "Other"). With an option
+    // picked as well, the pick stays the answer and the text rides along as the
+    // tool's per-question `notes` annotation, so neither is lost. A single-select
+    // normally holds one item; the plain join only matters if a client hands
+    // back an array for it, and then mirrors the old behavior.
+    const picked = picks.join(", ");
+    if (picked === "") {
+      if (customText !== "") {
+        answers[question.question] = customText;
+      }
       return;
     }
-    const text = Array.isArray(value) ? value.join(", ") : String(value);
-    if (text === "") {
-      return;
+    answers[question.question] = picked;
+    if (customText !== "") {
+      annotations[question.question] = { notes: customText };
     }
-    answers[question.question] = text;
   });
 
-  return { action: "answered", updatedInput: { ...toolInput, answers } };
+  if (options.reportUnanswered) {
+    for (const question of questions) {
+      if (answers[question.question] === undefined) {
+        annotations[question.question] = { unanswered: "skipped" };
+      }
+    }
+  }
+
+  return { action: "answered", updatedInput: withAnnotations(answers) };
+}
+
+function isElicitationScalar(value: unknown): value is string | number | boolean {
+  return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
 }
 
 /**
  * Coerce an arbitrary MCP `requestedSchema` into an ACP `ElicitationSchema`.
  * The two are structurally compatible JSON Schemas; we just guarantee the
- * `type: "object"` discriminator is present.
+ * `type: "object"` discriminator and a `properties` map are present. The v2
+ * schema requires both, so a client on SDK 2.2.0 or later rejects an MCP
+ * schema such as `{ type: "object" }` that has no `properties`.
  */
 function normalizeElicitationSchema(
   schema: Record<string, unknown> | undefined,
@@ -304,7 +399,8 @@ function normalizeElicitationSchema(
   if (!schema || typeof schema !== "object") {
     return { type: "object", properties: {} };
   }
-  return { ...(schema as ElicitationSchema), type: "object" };
+  const { properties } = schema as Partial<ElicitationSchema>;
+  return { ...(schema as ElicitationSchema), type: "object", properties: properties ?? {} };
 }
 
 /**

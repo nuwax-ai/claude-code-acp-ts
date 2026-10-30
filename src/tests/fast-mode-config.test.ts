@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { FastModeDisabledReason, ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
   buildConfigOptions,
@@ -114,7 +114,10 @@ describe("resolveFastModeEnabled", () => {
 
   it("rejects any other value", () => {
     expect(() => resolveFastModeEnabled({ ...base, value: "maybe" })).toThrow(
-      /Invalid value for config option fast/,
+      expect.objectContaining({
+        code: -32602,
+        message: expect.stringContaining("Invalid value for config option fast"),
+      }),
     );
   });
 });
@@ -253,6 +256,31 @@ describe("setSessionConfigOption Fast mode toggle", () => {
     expect(response.configOptions).toContainEqual(createFastModeConfigOption(true, false));
   });
 
+  it("rejects a value whose type differs from the option's advertised type", async () => {
+    // Advertised as `type: "boolean"`: "on" is not a boolean.
+    const booleanClient = setup({ useBooleanOption: true });
+    await expect(
+      booleanClient.agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: FAST_MODE_CONFIG_ID,
+        value: FAST_MODE_ON,
+      }),
+    ).rejects.toMatchObject({ code: -32602 });
+    expect(booleanClient.applyFlagSettings).not.toHaveBeenCalled();
+
+    // Advertised as an on/off select: `true` is not a string.
+    const selectClient = setup({ useBooleanOption: false });
+    await expect(
+      selectClient.agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: FAST_MODE_CONFIG_ID,
+        type: "boolean",
+        value: true,
+      }),
+    ).rejects.toMatchObject({ code: -32602 });
+    expect(selectClient.applyFlagSettings).not.toHaveBeenCalled();
+  });
+
   it("does not change session state when the SDK rejects the flag", async () => {
     const { agent, applyFlagSettings } = setup({ useBooleanOption: true });
     applyFlagSettings.mockRejectedValueOnce(new Error("nope"));
@@ -275,7 +303,7 @@ describe("setSessionConfigOption Fast mode toggle", () => {
 describe("syncFastModeState (SDK-driven state changes)", () => {
   const SESSION_ID = "fast-session";
 
-  function setup(opts: { fastModeEnabled: boolean; withOption: boolean }) {
+  function setup(opts: { fastModeEnabled: boolean; withOption: boolean; notices?: boolean }) {
     const sessionUpdates: SessionNotification[] = [];
     const client = {
       sessionUpdate: async (n: SessionNotification) => {
@@ -288,7 +316,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
 
     const agent = new ClaudeAcpAgent(client);
     (agent as unknown as { clientCapabilities: ClientCapabilities }).clientCapabilities = {
-      session: { configOptions: { boolean: {} } },
+      session: { configOptions: { boolean: {} }, ...(opts.notices ? { notices: {} } : {}) },
     };
 
     const session = {
@@ -396,6 +424,28 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
     // The same report again changes nothing the user can see: no repeat notice.
     await sync(SESSION_ID, session, "off", "extra_usage_disabled");
     expect(sessionUpdates).toHaveLength(2);
+  });
+
+  it("explains the flip as a live notice to a client on the notice contract", async () => {
+    const { sync, session, sessionUpdates } = setup({
+      fastModeEnabled: true,
+      withOption: true,
+      notices: true,
+    });
+
+    await sync(SESSION_ID, session, "off", "free");
+
+    // An operational advisory, not something the model said: no transcript line.
+    expect(sessionUpdates.map((n) => n.update.sessionUpdate)).toEqual([
+      "notice",
+      "config_option_update",
+    ]);
+    expect(sessionUpdates[0].update).toEqual({
+      sessionUpdate: "notice",
+      severity: "warning",
+      title: "Fast mode turned off",
+      description: "Not available on the free plan.",
+    });
   });
 
   it("updates the description when only the reason changes", async () => {
