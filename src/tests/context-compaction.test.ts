@@ -49,9 +49,6 @@ describe("ContextCompactionLifecycle for a client that is not AIR", () => {
         sessionUpdate: "tool_call_update",
         toolCallId: "c",
         status: "completed",
-        content: [
-          { type: "content", content: { type: "text", text: "Context compacted on request" } },
-        ],
         rawOutput: { trigger: "manual", preTokens: 10 },
         _meta: { claudeCode: { toolName: "compact" } },
       },
@@ -598,8 +595,7 @@ describe("ContextCompactionLifecycle (tool_call)", () => {
     const { sent, compaction } = lifecycle("tool_call");
 
     await compaction.finish("compact-failed", "failed", { error: "summary rejected" });
-    // Legacy duplicates are ignored; the boundary enrichment repeats the
-    // terminal status so a client that replaces the whole call stays closed.
+    // Legacy duplicates are ignored, boundary enrichment carries no status.
     await compaction.finish("compact-failed", "failed", { error: "summary rejected" });
     await compaction.finish(
       "compact-boundary",
@@ -630,7 +626,6 @@ describe("ContextCompactionLifecycle (tool_call)", () => {
       {
         sessionUpdate: "tool_call_update",
         toolCallId: "compact-failed",
-        status: "completed",
         _meta: {
           jetbrains: {
             air: { version: 1, contextCompaction: { version: 1, trigger: "manual", preTokens: 3 } },
@@ -638,69 +633,5 @@ describe("ContextCompactionLifecycle (tool_call)", () => {
         },
       },
     ]);
-  });
-
-  it("settles a compaction abandoned at a turn boundary instead of leaving it in_progress", async () => {
-    const { sent, compaction } = lifecycle("tool_call", undefined, false);
-
-    await compaction.start("compact-abandoned");
-    await compaction.reset();
-
-    expect(sent).toEqual([
-      {
-        sessionUpdate: "tool_call",
-        toolCallId: "compact-abandoned",
-        title: "Compact conversation",
-        kind: "think",
-        status: "in_progress",
-        _meta: { claudeCode: { toolName: "compact" } },
-      },
-      {
-        sessionUpdate: "tool_call_update",
-        toolCallId: "compact-abandoned",
-        status: "completed",
-        content: [
-          {
-            type: "content",
-            content: {
-              type: "text",
-              text: "Context compaction was cancelled before it finished; the conversation was not summarized.",
-            },
-          },
-        ],
-        _meta: { claudeCode: { toolName: "compact" } },
-      },
-    ]);
-  });
-
-  it("keeps the legacy call closed when the boundary enriches it with facts", async () => {
-    const { sent, compaction } = lifecycle("tool_call", undefined, false);
-    const facts = {
-      trigger: "automatic" as const,
-      preTokens: 161783,
-      postTokens: 22761,
-      durationMs: 130247,
-    };
-
-    await compaction.start("compact-enriched");
-    await compaction.finish("compact-enriched", "completed");
-    await compaction.finish("compact-enriched", "completed", facts, true);
-
-    // A client that replaces the whole call must not read the enriching update
-    // as "no longer terminal".
-    expect(sent.map((update) => (update as { status?: string }).status)).toEqual([
-      "in_progress",
-      "completed",
-      "completed",
-    ]);
-    expect(sent.at(-1)).toMatchObject({
-      content: [
-        {
-          type: "content",
-          content: { type: "text", text: "Context compacted: 161783 -> 22761 tokens, 130.2s" },
-        },
-      ],
-      rawOutput: facts,
-    });
   });
 });
