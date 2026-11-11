@@ -177,25 +177,34 @@ export class ContextCompactionLifecycle {
    *
    * A `compaction_update` entity still `in_progress` here never received its
    * terminal signal from the runtime and gets its one terminal status,
-   * `cancelled`. The legacy tool call is deliberately left as it was (an
-   * `in_progress` call): ACP `ToolCallStatus` has no cancelled state and that
-   * presentation's behavior predates this lifecycle. Never throws — a failed
-   * send is logged, so callers can settle the turn unconditionally.
+   * `cancelled`. The legacy tool call has no `cancelled` status in ACP v1, so
+   * it is settled as `completed` with the outcome in `content` instead of
+   * being left `in_progress`: a client that counts unclosed tool calls would
+   * otherwise resend it after the turn, out of its original position. Never
+   * throws — a failed send is logged, so callers can settle the turn
+   * unconditionally.
    */
   async reset(): Promise<void> {
     const state = this.activeCompaction;
     this.activeCompaction = undefined;
     this.outputDelivered = false;
     this.duplicateErrorOutput = undefined;
-    if (!state || state.terminalStatus || this.presentation !== "compaction_update") return;
+    if (!state || state.terminalStatus) return;
     state.terminalStatus = "cancelled";
+    if (this.presentation === "compaction_update") {
+      await this.sendQuietly(
+        {
+          sessionUpdate: "compaction_update",
+          compactionId: state.compactionId,
+          status: "cancelled",
+        },
+        "cancelled compaction",
+      );
+      return;
+    }
     await this.sendQuietly(
-      {
-        sessionUpdate: "compaction_update",
-        compactionId: state.compactionId,
-        status: "cancelled",
-      },
-      "cancelled compaction",
+      compactionToolCall.settled(state.compactionId, undefined, this.airClient),
+      "settled compaction",
     );
   }
 
@@ -365,7 +374,11 @@ export class ContextCompactionLifecycle {
     await this.send(
       compactionToolCall.finished(
         state.compactionId,
-        opened || firstTerminal ? status : undefined,
+        // A status-less update is a patch for clients that merge, but a client
+        // that replaces the whole call reads it as "no longer terminal" and
+        // leaves the call running. Repeating the terminal status on the
+        // enriching update is idempotent for both.
+        opened || firstTerminal || enrichTerminal ? status : undefined,
         metadata,
         opened,
         this.airClient,

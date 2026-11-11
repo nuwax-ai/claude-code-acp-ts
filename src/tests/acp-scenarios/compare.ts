@@ -12,6 +12,15 @@
  *   change since the previous report of the same tool call. An update with
  *   nothing new is not sent. ACP does not merge `_meta` keys, so every
  *   `_meta` key that origin/main sent must still be there.
+ * - The reverse for `status`: the update that only adds a tool call's facts
+ *   repeats the terminal `status` the previous report already carried, so a
+ *   client that replaces the whole call cannot read it as "no longer
+ *   terminal". origin/main left that status out, which leaves the call
+ *   running for such a client and makes it count the call as unclosed.
+ * - The legacy `Compact conversation` tool call also reports its facts as
+ *   `content`, so a client that does not render `rawOutput` has something to
+ *   show when the call is expanded. origin/main sent `rawOutput` only. AIR
+ *   gets neither: it reads the facts from `_meta.jetbrains.air`.
  * - A `compaction_update` leaves out a summary whose text is the same as the
  *   `compaction_summary_chunk` text that went out before it.
  * - A subagent message or thought is not sent again in full when the chunks
@@ -64,6 +73,9 @@ const REPLACED_FIELDS = [
   "rawOutput",
   "name",
 ];
+
+/** The title of the synthetic compaction tool call, as {@link flatten} holds it. */
+const COMPACT_TITLE = canonical("Compact conversation");
 
 /** `_meta` keys whose data a client appends. They are never "unchanged". */
 const APPENDED_META_KEYS = new Set([
@@ -298,7 +310,19 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
       const held = state.get(want.toolCallId as string) ?? new Map<string, string>();
       const w = flatten(want);
       const g = flatten(got);
-      for (const [key, value] of g) if (w.get(key) !== value) return false;
+      for (const [key, value] of g) {
+        if (w.get(key) === value) continue;
+        // Repeating the terminal status on the update that only enriches the
+        // call: origin/main left it out, and a client that replaces the whole
+        // call then reads the call as running again. The value it repeats is
+        // the one the client already holds, so nothing changes for it.
+        if (key === "status" && held.get(key) === value) continue;
+        // The synthetic compaction call adds its facts as `content` on top of
+        // the `rawOutput` origin/main sent, so a client without `rawOutput`
+        // support can show them.
+        if (key === "content" && held.get("title") === COMPACT_TITLE) continue;
+        return false;
+      }
       for (const [key, value] of w) {
         if (g.has(key)) continue;
         if (isMeta(key) || held.get(key) !== value) return false;
